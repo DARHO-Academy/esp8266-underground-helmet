@@ -1,2 +1,4 @@
 COMPONENT_SRCDIRS := .
 COMPONENT_ADD_INCLUDEDIRS := include
+
+COMPONENT_REQUIRES := nvs_flash app_config

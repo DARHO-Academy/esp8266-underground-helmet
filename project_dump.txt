@@ -1,0 +1,6571 @@
+﻿
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\Makefile =====
+PROJECT_NAME := underground_helmet
+
+include $(IDF_PATH)/make/project.mk
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\partitions.csv =====
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x100000,
+storage,  data, spiffs,  0x110000, 0x80000,
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\README.md =====
+# Underground Helmet
+
+Underground Helmet is an ESP8266 RTOS SDK project for monitoring safety conditions using sensors and showing the live status on a local web page.
+
+## Features
+
+- MQ gas sensor reading
+- DHT temperature and humidity reading
+- Ultrasonic distance reading
+- 5 LED status indicators
+- Buzzer alarm
+- Wi-Fi connection to an existing router or phone hotspot
+- Local web dashboard
+- JSON status API
+
+## System Modules
+
+```text
+main
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_auth\app_auth.c =====
+#include "app_auth.h"
+#include "sha256_min.h"
+
+#include "esp_log.h"
+#include "esp_system.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+static const char *TAG = "APP_AUTH";
+
+#define USERS_FILE_PATH     "/spiffs/users.dat"
+#define SALT_LEN_BYTES      8
+#define SALT_HEX_LEN        (SALT_LEN_BYTES * 2)
+#define HASH_LEN_BYTES      32
+#define HASH_HEX_LEN        (HASH_LEN_BYTES * 2)
+#define USER_LINE_MAX        160
+#define SESSION_TTL_SECONDS  (12 * 60 * 60) /* 12 hours */
+
+typedef struct {
+    bool in_use;
+    char token[APP_AUTH_TOKEN_LEN + 1];
+    char email[APP_AUTH_USERNAME_MAX];
+    char full_name[APP_AUTH_NAME_MAX];
+    int64_t expires_at;
+} app_auth_session_t;
+
+static app_auth_session_t sessions[APP_AUTH_MAX_SESSIONS];
+
+static void bytes_to_hex(const uint8_t *bytes, size_t len, char *out_hex)
+{
+    static const char *digits = "0123456789abcdef";
+
+    for (size_t i = 0; i < len; i++) {
+        out_hex[i * 2]     = digits[(bytes[i] >> 4) & 0x0F];
+        out_hex[i * 2 + 1] = digits[bytes[i] & 0x0F];
+    }
+    out_hex[len * 2] = '\0';
+}
+
+static void generate_random_hex(char *out_hex, size_t byte_len)
+{
+    uint8_t buffer[32];
+
+    if (byte_len > sizeof(buffer)) {
+        byte_len = sizeof(buffer);
+    }
+
+    for (size_t i = 0; i < byte_len; i++) {
+        buffer[i] = (uint8_t)(esp_random() & 0xFF);
+    }
+
+    bytes_to_hex(buffer, byte_len, out_hex);
+}
+
+static void hash_password(const char *password, const char *salt_hex, char *out_hash_hex)
+{
+    sha256_context_t ctx;
+    uint8_t digest[HASH_LEN_BYTES];
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, (const uint8_t *)salt_hex, strlen(salt_hex));
+    sha256_update(&ctx, (const uint8_t *)password, strlen(password));
+    sha256_final(&ctx, digest);
+
+    bytes_to_hex(digest, sizeof(digest), out_hash_hex);
+}
+
+/*
+ * Each stored line looks like:
+ *   email|salt_hex|hash_hex|full_name\n
+ * Fields cannot contain '|' or newline; inputs are validated for this.
+ */
+static bool field_is_clean(const char *value)
+{
+    if (value == NULL) {
+        return false;
+    }
+
+    for (const char *c = value; *c != '\0'; c++) {
+        if (*c == '|' || *c == '\n' || *c == '\r') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool find_user_line(const char *email, char *out_line, size_t out_line_size)
+{
+    FILE *file = fopen(USERS_FILE_PATH, "r");
+
+    if (file == NULL) {
+        return false;
+    }
+
+    char line[USER_LINE_MAX];
+    bool found = false;
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char line_copy[USER_LINE_MAX];
+        strncpy(line_copy, line, sizeof(line_copy) - 1);
+        line_copy[sizeof(line_copy) - 1] = '\0';
+
+        char *email_field = strtok(line_copy, "|");
+
+        if (email_field != NULL && strcmp(email_field, email) == 0) {
+            strncpy(out_line, line, out_line_size - 1);
+            out_line[out_line_size - 1] = '\0';
+            found = true;
+            break;
+        }
+    }
+
+    fclose(file);
+    return found;
+}
+
+void app_auth_init(void)
+{
+    memset(sessions, 0, sizeof(sessions));
+
+    FILE *file = fopen(USERS_FILE_PATH, "a");
+
+    if (file == NULL) {
+        ESP_LOGE(TAG, "Unable to open or create %s", USERS_FILE_PATH);
+        return;
+    }
+
+    fclose(file);
+
+    ESP_LOGI(TAG, "Auth store ready at %s", USERS_FILE_PATH);
+}
+
+app_auth_result_t app_auth_register(
+    const char *full_name,
+    const char *email,
+    const char *password
+)
+{
+    if (!field_is_clean(full_name) || !field_is_clean(email) || password == NULL) {
+        return APP_AUTH_ERR_INVALID_INPUT;
+    }
+
+    if (strlen(email) == 0 || strlen(password) == 0) {
+        return APP_AUTH_ERR_INVALID_INPUT;
+    }
+
+    if (strlen(email) >= APP_AUTH_USERNAME_MAX || strlen(full_name) >= APP_AUTH_NAME_MAX) {
+        return APP_AUTH_ERR_INVALID_INPUT;
+    }
+
+    char existing_line[USER_LINE_MAX];
+
+    if (find_user_line(email, existing_line, sizeof(existing_line))) {
+        return APP_AUTH_ERR_EXISTS;
+    }
+
+    char salt_hex[SALT_HEX_LEN + 1];
+    char hash_hex[HASH_HEX_LEN + 1];
+
+    generate_random_hex(salt_hex, SALT_LEN_BYTES);
+    hash_password(password, salt_hex, hash_hex);
+
+    FILE *file = fopen(USERS_FILE_PATH, "a");
+
+    if (file == NULL) {
+        ESP_LOGE(TAG, "Unable to open %s for writing", USERS_FILE_PATH);
+        return APP_AUTH_ERR_STORAGE;
+    }
+
+    fprintf(file, "%s|%s|%s|%s\n", email, salt_hex, hash_hex, full_name);
+    fclose(file);
+
+    ESP_LOGI(TAG, "Registered new user: %s", email);
+
+    return APP_AUTH_OK;
+}
+
+static app_auth_session_t *find_free_session_slot(void)
+{
+    int64_t now = (int64_t)time(NULL);
+
+    /* Prefer a genuinely empty slot, otherwise reuse the oldest expired one. */
+    for (int i = 0; i < APP_AUTH_MAX_SESSIONS; i++) {
+        if (!sessions[i].in_use) {
+            return &sessions[i];
+        }
+    }
+
+    for (int i = 0; i < APP_AUTH_MAX_SESSIONS; i++) {
+        if (sessions[i].expires_at <= now) {
+            return &sessions[i];
+        }
+    }
+
+    return NULL;
+}
+
+app_auth_result_t app_auth_login(
+    const char *email,
+    const char *password,
+    char *out_token
+)
+{
+    if (!field_is_clean(email) || password == NULL || out_token == NULL) {
+        return APP_AUTH_ERR_INVALID_INPUT;
+    }
+
+    char line[USER_LINE_MAX];
+
+    if (!find_user_line(email, line, sizeof(line))) {
+        return APP_AUTH_ERR_NOT_FOUND;
+    }
+
+    /* line format: email|salt_hex|hash_hex|full_name\n */
+    char *saved_email = strtok(line, "|");
+    char *saved_salt   = strtok(NULL, "|");
+    char *saved_hash   = strtok(NULL, "|");
+    char *saved_name   = strtok(NULL, "\r\n");
+
+    if (saved_email == NULL || saved_salt == NULL || saved_hash == NULL) {
+        ESP_LOGE(TAG, "Corrupt user record for %s", email);
+        return APP_AUTH_ERR_STORAGE;
+    }
+
+    char computed_hash[HASH_HEX_LEN + 1];
+    hash_password(password, saved_salt, computed_hash);
+
+    if (strcmp(computed_hash, saved_hash) != 0) {
+        return APP_AUTH_ERR_BAD_PASSWORD;
+    }
+
+    app_auth_session_t *slot = find_free_session_slot();
+
+    if (slot == NULL) {
+        return APP_AUTH_ERR_FULL;
+    }
+
+    generate_random_hex(slot->token, APP_AUTH_TOKEN_LEN / 2);
+    strncpy(slot->email, email, sizeof(slot->email) - 1);
+    slot->email[sizeof(slot->email) - 1] = '\0';
+
+    if (saved_name != NULL) {
+        strncpy(slot->full_name, saved_name, sizeof(slot->full_name) - 1);
+        slot->full_name[sizeof(slot->full_name) - 1] = '\0';
+    } else {
+        slot->full_name[0] = '\0';
+    }
+
+    slot->expires_at = (int64_t)time(NULL) + SESSION_TTL_SECONDS;
+    slot->in_use = true;
+
+    strncpy(out_token, slot->token, APP_AUTH_TOKEN_LEN);
+    out_token[APP_AUTH_TOKEN_LEN] = '\0';
+
+    ESP_LOGI(TAG, "Login OK for %s", email);
+
+    return APP_AUTH_OK;
+}
+
+void app_auth_logout(const char *token)
+{
+    if (token == NULL) {
+        return;
+    }
+
+    for (int i = 0; i < APP_AUTH_MAX_SESSIONS; i++) {
+        if (sessions[i].in_use && strcmp(sessions[i].token, token) == 0) {
+            sessions[i].in_use = false;
+            return;
+        }
+    }
+}
+
+bool app_auth_session_is_valid(const char *token, char *out_email, size_t out_email_size)
+{
+    if (token == NULL || strlen(token) == 0) {
+        return false;
+    }
+
+    int64_t now = (int64_t)time(NULL);
+
+    for (int i = 0; i < APP_AUTH_MAX_SESSIONS; i++) {
+        if (sessions[i].in_use && strcmp(sessions[i].token, token) == 0) {
+            if (sessions[i].expires_at <= now) {
+                sessions[i].in_use = false;
+                return false;
+            }
+
+            if (out_email != NULL && out_email_size > 0) {
+                strncpy(out_email, sessions[i].email, out_email_size - 1);
+                out_email[out_email_size - 1] = '\0';
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool app_auth_session_get_user(
+    const char *token,
+    char *out_email,
+    size_t out_email_size,
+    char *out_name,
+    size_t out_name_size
+)
+{
+    if (token == NULL || strlen(token) == 0) {
+        return false;
+    }
+
+    int64_t now = (int64_t)time(NULL);
+
+    for (int i = 0; i < APP_AUTH_MAX_SESSIONS; i++) {
+        if (sessions[i].in_use && strcmp(sessions[i].token, token) == 0) {
+            if (sessions[i].expires_at <= now) {
+                sessions[i].in_use = false;
+                return false;
+            }
+
+            if (out_email != NULL && out_email_size > 0) {
+                strncpy(out_email, sessions[i].email, out_email_size - 1);
+                out_email[out_email_size - 1] = '\0';
+            }
+
+            if (out_name != NULL && out_name_size > 0) {
+                strncpy(out_name, sessions[i].full_name, out_name_size - 1);
+                out_name[out_name_size - 1] = '\0';
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool app_auth_extract_token_from_cookie(const char *cookie_header, char *out_token, size_t out_token_size)
+{
+    if (cookie_header == NULL || out_token == NULL || out_token_size == 0) {
+        return false;
+    }
+
+    const char *marker = "session=";
+    const char *start = strstr(cookie_header, marker);
+
+    if (start == NULL) {
+        return false;
+    }
+
+    start += strlen(marker);
+
+    size_t i = 0;
+
+    while (start[i] != '\0' && start[i] != ';' && i < out_token_size - 1) {
+        out_token[i] = start[i];
+        i++;
+    }
+
+    out_token[i] = '\0';
+
+    return i > 0;
+}
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_auth\component.mk =====
+COMPONENT_SRCDIRS := .
+COMPONENT_ADD_INCLUDEDIRS := include
+
+COMPONENT_REQUIRES := spiffs vfs
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_auth\sha256_min.c =====
+#include "sha256_min.h"
+
+#include <string.h>
+
+#define ROTRIGHT(a,b) (((a) >> (b)) | ((a) << (32 - (b))))
+#define CH(x,y,z)     (((x) & (y)) ^ (~(x) & (z)))
+#define MAJ(x,y,z)    (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define EP0(x)        (ROTRIGHT((x), 2) ^ ROTRIGHT((x), 13) ^ ROTRIGHT((x), 22))
+#define EP1(x)        (ROTRIGHT((x), 6) ^ ROTRIGHT((x), 11) ^ ROTRIGHT((x), 25))
+#define SIG0(x)       (ROTRIGHT((x), 7) ^ ROTRIGHT((x), 18) ^ ((x) >> 3))
+#define SIG1(x)       (ROTRIGHT((x), 17) ^ ROTRIGHT((x), 19) ^ ((x) >> 10))
+
+static const uint32_t k[64] = {
+    0x428a2f98UL, 0x71374491UL, 0xb5c0fbcfUL, 0xe9b5dba5UL,
+    0x3956c25bUL, 0x59f111f1UL, 0x923f82a4UL, 0xab1c5ed5UL,
+    0xd807aa98UL, 0x12835b01UL, 0x243185beUL, 0x550c7dc3UL,
+    0x72be5d74UL, 0x80deb1feUL, 0x9bdc06a7UL, 0xc19bf174UL,
+    0xe49b69c1UL, 0xefbe4786UL, 0x0fc19dc6UL, 0x240ca1ccUL,
+    0x2de92c6fUL, 0x4a7484aaUL, 0x5cb0a9dcUL, 0x76f988daUL,
+    0x983e5152UL, 0xa831c66dUL, 0xb00327c8UL, 0xbf597fc7UL,
+    0xc6e00bf3UL, 0xd5a79147UL, 0x06ca6351UL, 0x14292967UL,
+    0x27b70a85UL, 0x2e1b2138UL, 0x4d2c6dfcUL, 0x53380d13UL,
+    0x650a7354UL, 0x766a0abbUL, 0x81c2c92eUL, 0x92722c85UL,
+    0xa2bfe8a1UL, 0xa81a664bUL, 0xc24b8b70UL, 0xc76c51a3UL,
+    0xd192e819UL, 0xd6990624UL, 0xf40e3585UL, 0x106aa070UL,
+    0x19a4c116UL, 0x1e376c08UL, 0x2748774cUL, 0x34b0bcb5UL,
+    0x391c0cb3UL, 0x4ed8aa4aUL, 0x5b9cca4fUL, 0x682e6ff3UL,
+    0x748f82eeUL, 0x78a5636fUL, 0x84c87814UL, 0x8cc70208UL,
+    0x90befffaUL, 0xa4506cebUL, 0xbef9a3f7UL, 0xc67178f2UL
+};
+
+static void sha256_transform(sha256_context_t *ctx, const uint8_t data[64])
+{
+    uint32_t m[64];
+    uint32_t a, b, c, d, e, f, g, h;
+    uint32_t t1, t2;
+
+    for (uint32_t i = 0, j = 0; i < 16; i++, j += 4) {
+        m[i] = ((uint32_t)data[j] << 24) |
+               ((uint32_t)data[j + 1] << 16) |
+               ((uint32_t)data[j + 2] << 8) |
+               ((uint32_t)data[j + 3]);
+    }
+
+    for (uint32_t i = 16; i < 64; i++) {
+        m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
+    }
+
+    a = ctx->state[0];
+    b = ctx->state[1];
+    c = ctx->state[2];
+    d = ctx->state[3];
+    e = ctx->state[4];
+    f = ctx->state[5];
+    g = ctx->state[6];
+    h = ctx->state[7];
+
+    for (uint32_t i = 0; i < 64; i++) {
+        t1 = h + EP1(e) + CH(e, f, g) + k[i] + m[i];
+        t2 = EP0(a) + MAJ(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    ctx->state[0] += a;
+    ctx->state[1] += b;
+    ctx->state[2] += c;
+    ctx->state[3] += d;
+    ctx->state[4] += e;
+    ctx->state[5] += f;
+    ctx->state[6] += g;
+    ctx->state[7] += h;
+}
+
+void sha256_init(sha256_context_t *ctx)
+{
+    memset(ctx, 0, sizeof(*ctx));
+
+    ctx->state[0] = 0x6a09e667UL;
+    ctx->state[1] = 0xbb67ae85UL;
+    ctx->state[2] = 0x3c6ef372UL;
+    ctx->state[3] = 0xa54ff53aUL;
+    ctx->state[4] = 0x510e527fUL;
+    ctx->state[5] = 0x9b05688cUL;
+    ctx->state[6] = 0x1f83d9abUL;
+    ctx->state[7] = 0x5be0cd19UL;
+}
+
+void sha256_update(sha256_context_t *ctx, const uint8_t *data, size_t len)
+{
+    if (ctx == NULL || data == NULL || len == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        ctx->data[ctx->datalen++] = data[i];
+
+        if (ctx->datalen == 64) {
+            sha256_transform(ctx, ctx->data);
+            ctx->bitlen += 512;
+            ctx->datalen = 0;
+        }
+    }
+}
+
+void sha256_final(sha256_context_t *ctx, uint8_t hash[32])
+{
+    uint32_t i = ctx->datalen;
+
+    /* Pad remaining data. */
+    if (ctx->datalen < 56) {
+        ctx->data[i++] = 0x80;
+
+        while (i < 56) {
+            ctx->data[i++] = 0x00;
+        }
+    } else {
+        ctx->data[i++] = 0x80;
+
+        while (i < 64) {
+            ctx->data[i++] = 0x00;
+        }
+
+        sha256_transform(ctx, ctx->data);
+        memset(ctx->data, 0, 56);
+    }
+
+    ctx->bitlen += (uint64_t)ctx->datalen * 8ULL;
+
+    ctx->data[63] = (uint8_t)(ctx->bitlen);
+    ctx->data[62] = (uint8_t)(ctx->bitlen >> 8);
+    ctx->data[61] = (uint8_t)(ctx->bitlen >> 16);
+    ctx->data[60] = (uint8_t)(ctx->bitlen >> 24);
+    ctx->data[59] = (uint8_t)(ctx->bitlen >> 32);
+    ctx->data[58] = (uint8_t)(ctx->bitlen >> 40);
+    ctx->data[57] = (uint8_t)(ctx->bitlen >> 48);
+    ctx->data[56] = (uint8_t)(ctx->bitlen >> 56);
+
+    sha256_transform(ctx, ctx->data);
+
+    for (i = 0; i < 4; i++) {
+        hash[i]      = (uint8_t)((ctx->state[0] >> (24 - i * 8)) & 0x000000ffUL);
+        hash[i + 4]  = (uint8_t)((ctx->state[1] >> (24 - i * 8)) & 0x000000ffUL);
+        hash[i + 8]  = (uint8_t)((ctx->state[2] >> (24 - i * 8)) & 0x000000ffUL);
+        hash[i + 12] = (uint8_t)((ctx->state[3] >> (24 - i * 8)) & 0x000000ffUL);
+        hash[i + 16] = (uint8_t)((ctx->state[4] >> (24 - i * 8)) & 0x000000ffUL);
+        hash[i + 20] = (uint8_t)((ctx->state[5] >> (24 - i * 8)) & 0x000000ffUL);
+        hash[i + 24] = (uint8_t)((ctx->state[6] >> (24 - i * 8)) & 0x000000ffUL);
+        hash[i + 28] = (uint8_t)((ctx->state[7] >> (24 - i * 8)) & 0x000000ffUL);
+    }
+}
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_auth\include\app_auth.h =====
+#ifndef APP_AUTH_H
+#define APP_AUTH_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define APP_AUTH_TOKEN_LEN      32   /* hex chars, not including null terminator */
+#define APP_AUTH_USERNAME_MAX   64
+#define APP_AUTH_NAME_MAX       48
+#define APP_AUTH_MAX_SESSIONS   4
+
+typedef enum {
+    APP_AUTH_OK = 0,
+    APP_AUTH_ERR_EXISTS,
+    APP_AUTH_ERR_NOT_FOUND,
+    APP_AUTH_ERR_BAD_PASSWORD,
+    APP_AUTH_ERR_INVALID_INPUT,
+    APP_AUTH_ERR_STORAGE,
+    APP_AUTH_ERR_FULL
+} app_auth_result_t;
+
+/*
+ * Mounts and prepares the user store.
+ * Must be called once at boot, after SPIFFS is mounted.
+ */
+void app_auth_init(void);
+
+/*
+ * Registers a new user.
+ * email is used as the unique login identifier (case-sensitive as given).
+ * Returns APP_AUTH_ERR_EXISTS if the email is already registered.
+ */
+app_auth_result_t app_auth_register(
+    const char *full_name,
+    const char *email,
+    const char *password
+);
+
+/*
+ * Validates email/password and, on success, creates a new session and
+ * writes its token (as a null-terminated hex string) into out_token.
+ * out_token must be at least APP_AUTH_TOKEN_LEN + 1 bytes.
+ */
+app_auth_result_t app_auth_login(
+    const char *email,
+    const char *password,
+    char *out_token
+);
+
+/*
+ * Removes a session (logout). No-op if the token is unknown.
+ */
+void app_auth_logout(const char *token);
+
+/*
+ * Returns true and fills out_email if the token maps to a live session.
+ */
+bool app_auth_session_is_valid(const char *token, char *out_email, size_t out_email_size);
+
+bool app_auth_session_get_user(
+    const char *token,
+    char *out_email,
+    size_t out_email_size,
+    char *out_name,
+    size_t out_name_size
+);
+
+/*
+ * Extracts the "session" cookie value from a raw Cookie header value.
+ * Returns true if found, writing into out_token (size out_token_size).
+ */
+bool app_auth_extract_token_from_cookie(const char *cookie_header, char *out_token, size_t out_token_size);
+
+#endif
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_auth\include\sha256_min.h =====
+#ifndef SHA256_MIN_H
+#define SHA256_MIN_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct {
+    uint8_t data[64];
+    uint32_t datalen;
+    uint64_t bitlen;
+    uint32_t state[8];
+} sha256_context_t;
+
+void sha256_init(sha256_context_t *ctx);
+void sha256_update(sha256_context_t *ctx, const uint8_t *data, size_t len);
+void sha256_final(sha256_context_t *ctx, uint8_t hash[32]);
+
+#endif
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_config\component.mk =====
+COMPONENT_ADD_INCLUDEDIRS := include
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_config\include\app_config.h =====
+#ifndef APP_CONFIG_H
+#define APP_CONFIG_H
+
+#define APP_PROJECT_NAME        "Underground Helmet"
+#define APP_FIRMWARE_VERSION    "1.0.0"
+
+/*
+ * Wi-Fi mode:
+ * STA mode means ESP8266 connects to normal Wi-Fi/router.
+ * Phone or PC must be connected to the same Wi-Fi network.
+ */
+#define APP_WIFI_MODE_STA       1
+#define APP_WIFI_MODE_AP        0
+
+#define APP_WIFI_STA_SSID       "patrick"
+#define APP_WIFI_STA_PASSWORD   "12345678"
+#define APP_WIFI_MAX_RETRY      5
+
+/*
+ * Optional AP values.
+ * Keep these only for later fallback mode.
+ */
+#define APP_WIFI_AP_SSID        "UNDERGROUND_HELMET"
+#define APP_WIFI_AP_PASSWORD    "12345678"
+#define APP_WIFI_AP_CHANNEL     1
+#define APP_WIFI_AP_MAX_CONN    4
+
+/*
+ * Sensor input mode:
+ * 0 = do not show fake readings; dashboard will show sensors as not connected
+ *     until real sensor drivers are added.
+ * 1 = use fixed demo readings for UI/testing without hardware.
+ */
+#define APP_SENSOR_USE_TEST_VALUES  0
+
+/*
+ * ESP8266 has only one real analog input: A0.
+ * APP_GAS_ADC_CHANNEL 0 means internal A0.
+ * APP_FLAME_ADC_CHANNEL 1 means external ADC channel 1.
+ *
+ * If you do not use external ADC/multiplexer, gas and flame cannot both be
+ * analog at the same time on ESP8266.
+ */
+#define APP_GAS_ADC_CHANNEL         0
+#define APP_FLAME_ADC_CHANNEL       1
+
+/*
+ * Default digital sensor pins.
+ */
+#define APP_DHT_GPIO                5
+#define APP_ULTRASONIC_TRIG_GPIO    4
+#define APP_ULTRASONIC_ECHO_GPIO    14
+
+/*
+ * Four LED outputs:
+ * 1. Gas LED
+ * 2. Flame LED
+ * 3. Heat Index LED
+ * 4. Distance LED
+ *
+ * Alarm is NOT a LED.
+ * Alarm is the buzzer sound.
+ */
+#define APP_LED_GAS_GPIO            16
+#define APP_LED_FLAME_GPIO          0
+#define APP_LED_HEAT_INDEX_GPIO     2
+#define APP_LED_DISTANCE_GPIO       12
+
+#define APP_BUZZER_GPIO             13
+
+/*
+ * Danger thresholds.
+ * Temperature and humidity are not separate LEDs anymore.
+ * They create one heat index value and one heat index warning LED.
+ */
+#define APP_GAS_WARNING_LEVEL           600
+#define APP_FLAME_WARNING_LEVEL         500
+#define APP_HEAT_INDEX_WARNING_LEVEL    40
+#define APP_DISTANCE_WARNING_CM         30
+
+/*
+ * Flame sensor logic:
+ * 0 = flame warning when analog value is LOWER than threshold
+ * 1 = flame warning when analog value is HIGHER than threshold
+ *
+ * Many flame modules give lower analog value when flame is near.
+ * Test your module and change this if needed.
+ */
+#define APP_FLAME_HIGHER_IS_DANGER      0
+
+/*
+ * Timing
+ */
+#define APP_SENSOR_READ_DELAY_MS    2000
+#define APP_WEB_UPDATE_DELAY_MS     1000
+
+#endif
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_outputs\app_outputs.c =====
+#include "app_outputs.h"
+
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+static const char *TAG = "APP_OUTPUTS";
+
+static void app_outputs_configure_pin(int gpio)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << gpio),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = 0,
+        .pull_down_en = 0,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    gpio_config(&io_conf);
+}
+
+static void app_outputs_write(int gpio, bool on)
+{
+    gpio_set_level(gpio, on ? 1 : 0);
+}
+
+void app_outputs_init(void)
+{
+    ESP_LOGI(TAG, "Initializing output pins");
+
+    const app_system_pin_config_t *pins = app_system_get_pins();
+
+    app_outputs_configure_pin(pins->led_gas_gpio);
+    app_outputs_configure_pin(pins->led_flame_gpio);
+    app_outputs_configure_pin(pins->led_heat_index_gpio);
+    app_outputs_configure_pin(pins->led_distance_gpio);
+    app_outputs_configure_pin(pins->buzzer_gpio);
+
+    app_outputs_set_all_off();
+
+    ESP_LOGI(
+        TAG,
+        "Outputs initialized: led_gas=%d led_flame=%d led_heat_index=%d led_distance=%d buzzer=%d",
+        pins->led_gas_gpio,
+        pins->led_flame_gpio,
+        pins->led_heat_index_gpio,
+        pins->led_distance_gpio,
+        pins->buzzer_gpio
+    );
+}
+
+void app_outputs_update(const app_system_state_t *state)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    const app_system_pin_config_t *pins = app_system_get_pins();
+
+    app_outputs_write(pins->led_gas_gpio, state->gas_warning);
+    app_outputs_write(pins->led_flame_gpio, state->flame_warning);
+    app_outputs_write(pins->led_heat_index_gpio, state->heat_index_warning);
+    app_outputs_write(pins->led_distance_gpio, state->distance_warning);
+
+    /*
+     * Alarm is buzzer sound.
+     * There is no alarm LED.
+     */
+    app_outputs_set_buzzer(state->alarm_active);
+}
+
+void app_outputs_set_all_off(void)
+{
+    const app_system_pin_config_t *pins = app_system_get_pins();
+
+    app_outputs_write(pins->led_gas_gpio, false);
+    app_outputs_write(pins->led_flame_gpio, false);
+    app_outputs_write(pins->led_heat_index_gpio, false);
+    app_outputs_write(pins->led_distance_gpio, false);
+    app_outputs_write(pins->buzzer_gpio, false);
+}
+
+void app_outputs_set_buzzer(bool on)
+{
+    const app_system_pin_config_t *pins = app_system_get_pins();
+    app_outputs_write(pins->buzzer_gpio, on);
+}
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_outputs\component.mk =====
+COMPONENT_SRCDIRS := .
+COMPONENT_ADD_INCLUDEDIRS := include
+
+COMPONENT_REQUIRES := app_config app_system
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_outputs\include\app_outputs.h =====
+#ifndef APP_OUTPUTS_H
+#define APP_OUTPUTS_H
+
+#include <stdbool.h>
+
+#include "app_system.h"
+
+void app_outputs_init(void);
+
+void app_outputs_update(const app_system_state_t *state);
+
+void app_outputs_set_all_off(void);
+
+void app_outputs_set_buzzer(bool on);
+
+#endif
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_sensors\app_sensors.c =====
+#include "app_sensors.h"
+#include "app_config.h"
+#include "app_system.h"
+
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+#include <string.h>
+
+static const char *TAG = "APP_SENSORS";
+
+void app_sensors_init(void)
+{
+    ESP_LOGI(TAG, "Initializing sensors");
+
+    const app_system_pin_config_t *pins = app_system_get_pins();
+
+    gpio_config_t trig_conf = {
+        .pin_bit_mask = (1ULL << pins->ultrasonic_trig_gpio),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = 0,
+        .pull_down_en = 0,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&trig_conf);
+
+    gpio_config_t echo_conf = {
+        .pin_bit_mask = (1ULL << pins->ultrasonic_echo_gpio),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = 0,
+        .pull_down_en = 0,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&echo_conf);
+
+    gpio_set_level(pins->ultrasonic_trig_gpio, 0);
+
+    ESP_LOGI(
+        TAG,
+        "Sensors initialized: gas_adc=%d flame_adc=%d dht_gpio=%d trig_gpio=%d echo_gpio=%d",
+        pins->gas_adc_channel,
+        pins->flame_adc_channel,
+        pins->dht_gpio,
+        pins->ultrasonic_trig_gpio,
+        pins->ultrasonic_echo_gpio
+    );
+}
+
+bool app_sensors_read(app_sensor_data_t *data)
+{
+    if (data == NULL) {
+        return false;
+    }
+
+    memset(data, 0, sizeof(app_sensor_data_t));
+
+#if APP_SENSOR_USE_TEST_VALUES
+    /*
+     * Demo mode only.
+     * Enable APP_SENSOR_USE_TEST_VALUES in app_config.h when you want to test
+     * the web UI without real sensors connected.
+     */
+    data->gas_raw = 350;
+    data->flame_raw = 820;
+    data->temperature_c = 30.0f;
+    data->humidity_percent = 68.0f;
+    data->distance_cm = 100.0f;
+
+    data->gas_ok = true;
+    data->flame_ok = true;
+    data->dht_ok = true;
+    data->ultrasonic_ok = true;
+
+    return true;
+#else
+    /*
+     * Real sensor drivers are not implemented yet.
+     *
+     * Returning false is intentional: the dashboard must not show fake sensor
+     * data as if real hardware is connected.
+     *
+     * Next step:
+     * - read MQ gas sensor from A0 or external ADC and set gas_ok
+     * - read flame sensor from A0 or external ADC and set flame_ok
+     * - read DHT temperature/humidity and set dht_ok
+     * - read ultrasonic echo pulse and set ultrasonic_ok
+     */
+    data->gas_ok = false;
+    data->flame_ok = false;
+    data->dht_ok = false;
+    data->ultrasonic_ok = false;
+
+    return false;
+#endif
+}
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_sensors\component.mk =====
+COMPONENT_SRCDIRS := .
+COMPONENT_ADD_INCLUDEDIRS := include
+
+COMPONENT_REQUIRES := app_config app_system
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_sensors\include\app_sensors.h =====
+#ifndef APP_SENSORS_H
+#define APP_SENSORS_H
+
+#include <stdbool.h>
+
+typedef struct
+{
+    int gas_raw;
+    bool gas_ok;
+
+    int flame_raw;
+    bool flame_ok;
+
+    float temperature_c;
+    float humidity_percent;
+    bool dht_ok;
+
+    float distance_cm;
+    bool ultrasonic_ok;
+} app_sensor_data_t;
+
+void app_sensors_init(void);
+
+bool app_sensors_read(app_sensor_data_t *data);
+
+#endif
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_system\app_system.c =====
+#include "app_system.h"
+#include "app_config.h"
+
+#include "esp_log.h"
+#include "nvs.h"
+
+#include <string.h>
+
+static const char *TAG = "APP_SYSTEM";
+
+#define NVS_NAMESPACE              "app_sys"
+
+/* Threshold keys */
+#define NVS_KEY_GAS                "gas_warn"
+#define NVS_KEY_FLAME              "flame_warn"
+#define NVS_KEY_HEAT_INDEX         "heat_warn"
+#define NVS_KEY_DISTANCE           "dist_warn"
+
+/* Pin keys */
+#define NVS_KEY_GAS_ADC            "gas_adc"
+#define NVS_KEY_FLAME_ADC          "flame_adc"
+#define NVS_KEY_DHT_GPIO           "dht_gpio"
+#define NVS_KEY_TRIG_GPIO          "trig_gpio"
+#define NVS_KEY_ECHO_GPIO          "echo_gpio"
+#define NVS_KEY_LED_GAS            "led_gas"
+#define NVS_KEY_LED_FLAME          "led_flame"
+#define NVS_KEY_LED_HEAT_INDEX     "led_heat"
+#define NVS_KEY_LED_DISTANCE       "led_dist"
+#define NVS_KEY_BUZZER             "buzzer"
+
+static app_system_state_t system_state;
+static app_system_thresholds_t thresholds;
+static app_system_pin_config_t pin_config;
+
+/*
+ * Heat index calculation.
+ * Input: Celsius and humidity percent.
+ * Output: Celsius.
+ */
+static float app_system_compute_heat_index_c(float temperature_c, float humidity_percent)
+{
+    if (temperature_c < 27.0f || humidity_percent < 40.0f) {
+        return temperature_c;
+    }
+
+    float temperature_f = (temperature_c * 9.0f / 5.0f) + 32.0f;
+    float rh = humidity_percent;
+
+    float heat_index_f =
+        -42.379f +
+        2.04901523f * temperature_f +
+        10.14333127f * rh -
+        0.22475541f * temperature_f * rh -
+        0.00683783f * temperature_f * temperature_f -
+        0.05481717f * rh * rh +
+        0.00122874f * temperature_f * temperature_f * rh +
+        0.00085282f * temperature_f * rh * rh -
+        0.00000199f * temperature_f * temperature_f * rh * rh;
+
+    return (heat_index_f - 32.0f) * 5.0f / 9.0f;
+}
+
+static void load_default_thresholds(void)
+{
+    thresholds.gas_warning_level = APP_GAS_WARNING_LEVEL;
+    thresholds.flame_warning_level = APP_FLAME_WARNING_LEVEL;
+    thresholds.heat_index_warning_level = APP_HEAT_INDEX_WARNING_LEVEL;
+    thresholds.distance_warning_cm = APP_DISTANCE_WARNING_CM;
+}
+
+static void load_default_pins(void)
+{
+    pin_config.gas_adc_channel = APP_GAS_ADC_CHANNEL;
+    pin_config.flame_adc_channel = APP_FLAME_ADC_CHANNEL;
+
+    pin_config.dht_gpio = APP_DHT_GPIO;
+    pin_config.ultrasonic_trig_gpio = APP_ULTRASONIC_TRIG_GPIO;
+    pin_config.ultrasonic_echo_gpio = APP_ULTRASONIC_ECHO_GPIO;
+
+    pin_config.led_gas_gpio = APP_LED_GAS_GPIO;
+    pin_config.led_flame_gpio = APP_LED_FLAME_GPIO;
+    pin_config.led_heat_index_gpio = APP_LED_HEAT_INDEX_GPIO;
+    pin_config.led_distance_gpio = APP_LED_DISTANCE_GPIO;
+
+    pin_config.buzzer_gpio = APP_BUZZER_GPIO;
+}
+
+static void load_thresholds_from_nvs(void)
+{
+    load_default_thresholds();
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No saved thresholds in NVS yet, using defaults");
+        return;
+    }
+
+    int32_t value;
+
+    if (nvs_get_i32(handle, NVS_KEY_GAS, &value) == ESP_OK) {
+        thresholds.gas_warning_level = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_FLAME, &value) == ESP_OK) {
+        thresholds.flame_warning_level = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_HEAT_INDEX, &value) == ESP_OK) {
+        thresholds.heat_index_warning_level = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_DISTANCE, &value) == ESP_OK) {
+        thresholds.distance_warning_cm = (int)value;
+    }
+
+    nvs_close(handle);
+
+    ESP_LOGI(
+        TAG,
+        "Loaded thresholds: gas=%d flame=%d heat_index=%d distance=%d",
+        thresholds.gas_warning_level,
+        thresholds.flame_warning_level,
+        thresholds.heat_index_warning_level,
+        thresholds.distance_warning_cm
+    );
+}
+
+static void load_pins_from_nvs(void)
+{
+    load_default_pins();
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No saved pin config in NVS yet, using defaults");
+        return;
+    }
+
+    int32_t value;
+
+    if (nvs_get_i32(handle, NVS_KEY_GAS_ADC, &value) == ESP_OK) {
+        pin_config.gas_adc_channel = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_FLAME_ADC, &value) == ESP_OK) {
+        pin_config.flame_adc_channel = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_DHT_GPIO, &value) == ESP_OK) {
+        pin_config.dht_gpio = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_TRIG_GPIO, &value) == ESP_OK) {
+        pin_config.ultrasonic_trig_gpio = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_ECHO_GPIO, &value) == ESP_OK) {
+        pin_config.ultrasonic_echo_gpio = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_LED_GAS, &value) == ESP_OK) {
+        pin_config.led_gas_gpio = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_LED_FLAME, &value) == ESP_OK) {
+        pin_config.led_flame_gpio = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_LED_HEAT_INDEX, &value) == ESP_OK) {
+        pin_config.led_heat_index_gpio = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_LED_DISTANCE, &value) == ESP_OK) {
+        pin_config.led_distance_gpio = (int)value;
+    }
+
+    if (nvs_get_i32(handle, NVS_KEY_BUZZER, &value) == ESP_OK) {
+        pin_config.buzzer_gpio = (int)value;
+    }
+
+    nvs_close(handle);
+
+    ESP_LOGI(
+        TAG,
+        "Loaded pins: gas_adc=%d flame_adc=%d dht=%d trig=%d echo=%d led_gas=%d led_flame=%d led_heat=%d led_dist=%d buzzer=%d",
+        pin_config.gas_adc_channel,
+        pin_config.flame_adc_channel,
+        pin_config.dht_gpio,
+        pin_config.ultrasonic_trig_gpio,
+        pin_config.ultrasonic_echo_gpio,
+        pin_config.led_gas_gpio,
+        pin_config.led_flame_gpio,
+        pin_config.led_heat_index_gpio,
+        pin_config.led_distance_gpio,
+        pin_config.buzzer_gpio
+    );
+}
+
+static bool save_thresholds_to_nvs(const app_system_thresholds_t *new_thresholds)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for threshold writing");
+        return false;
+    }
+
+    bool ok = true;
+
+    ok &= (nvs_set_i32(handle, NVS_KEY_GAS, new_thresholds->gas_warning_level) == ESP_OK);
+    ok &= (nvs_set_i32(handle, NVS_KEY_FLAME, new_thresholds->flame_warning_level) == ESP_OK);
+    ok &= (nvs_set_i32(handle, NVS_KEY_HEAT_INDEX, new_thresholds->heat_index_warning_level) == ESP_OK);
+    ok &= (nvs_set_i32(handle, NVS_KEY_DISTANCE, new_thresholds->distance_warning_cm) == ESP_OK);
+
+    if (ok) {
+        ok = (nvs_commit(handle) == ESP_OK);
+    }
+
+    nvs_close(handle);
+
+    return ok;
+}
+
+static bool save_pins_to_nvs(const app_system_pin_config_t *pins)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for pin writing");
+        return false;
+    }
+
+    bool ok = true;
+
+    ok &= (nvs_set_i32(handle, NVS_KEY_GAS_ADC, pins->gas_adc_channel) == ESP_OK);
+    ok &= (nvs_set_i32(handle, NVS_KEY_FLAME_ADC, pins->flame_adc_channel) == ESP_OK);
+
+    ok &= (nvs_set_i32(handle, NVS_KEY_DHT_GPIO, pins->dht_gpio) == ESP_OK);
+    ok &= (nvs_set_i32(handle, NVS_KEY_TRIG_GPIO, pins->ultrasonic_trig_gpio) == ESP_OK);
+    ok &= (nvs_set_i32(handle, NVS_KEY_ECHO_GPIO, pins->ultrasonic_echo_gpio) == ESP_OK);
+
+    ok &= (nvs_set_i32(handle, NVS_KEY_LED_GAS, pins->led_gas_gpio) == ESP_OK);
+    ok &= (nvs_set_i32(handle, NVS_KEY_LED_FLAME, pins->led_flame_gpio) == ESP_OK);
+    ok &= (nvs_set_i32(handle, NVS_KEY_LED_HEAT_INDEX, pins->led_heat_index_gpio) == ESP_OK);
+    ok &= (nvs_set_i32(handle, NVS_KEY_LED_DISTANCE, pins->led_distance_gpio) == ESP_OK);
+
+    ok &= (nvs_set_i32(handle, NVS_KEY_BUZZER, pins->buzzer_gpio) == ESP_OK);
+
+    if (ok) {
+        ok = (nvs_commit(handle) == ESP_OK);
+    }
+
+    nvs_close(handle);
+
+    return ok;
+}
+
+static bool gpio_is_valid(int gpio)
+{
+    return gpio >= 0 && gpio <= 16;
+}
+
+static bool adc_channel_is_valid(int channel)
+{
+    /*
+     * ESP8266 internal ADC is channel 0 only.
+     * Channels above 0 are allowed here only for future external ADC/multiplexer logic.
+     */
+    return channel >= 0 && channel <= 7;
+}
+
+static bool digital_pin_used_twice(const app_system_pin_config_t *pins)
+{
+    int values[] = {
+        pins->dht_gpio,
+        pins->ultrasonic_trig_gpio,
+        pins->ultrasonic_echo_gpio,
+        pins->led_gas_gpio,
+        pins->led_flame_gpio,
+        pins->led_heat_index_gpio,
+        pins->led_distance_gpio,
+        pins->buzzer_gpio
+    };
+
+    int count = sizeof(values) / sizeof(values[0]);
+
+    for (int i = 0; i < count; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (values[i] == values[j]) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool pin_config_is_valid(const app_system_pin_config_t *pins)
+{
+    if (pins == NULL) {
+        return false;
+    }
+
+    if (!adc_channel_is_valid(pins->gas_adc_channel)) {
+        return false;
+    }
+
+    if (!adc_channel_is_valid(pins->flame_adc_channel)) {
+        return false;
+    }
+
+    if (!gpio_is_valid(pins->dht_gpio)) {
+        return false;
+    }
+
+    if (!gpio_is_valid(pins->ultrasonic_trig_gpio)) {
+        return false;
+    }
+
+    if (!gpio_is_valid(pins->ultrasonic_echo_gpio)) {
+        return false;
+    }
+
+    if (!gpio_is_valid(pins->led_gas_gpio)) {
+        return false;
+    }
+
+    if (!gpio_is_valid(pins->led_flame_gpio)) {
+        return false;
+    }
+
+    if (!gpio_is_valid(pins->led_heat_index_gpio)) {
+        return false;
+    }
+
+    if (!gpio_is_valid(pins->led_distance_gpio)) {
+        return false;
+    }
+
+    if (!gpio_is_valid(pins->buzzer_gpio)) {
+        return false;
+    }
+
+    if (digital_pin_used_twice(pins)) {
+        return false;
+    }
+
+    return true;
+}
+
+static void app_system_evaluate_warnings(void)
+{
+    system_state.heat_index_c = app_system_compute_heat_index_c(
+        system_state.temperature_c,
+        system_state.humidity_percent
+    );
+
+    system_state.gas_warning =
+        system_state.gas_connected &&
+        system_state.gas_raw >= thresholds.gas_warning_level;
+
+#if APP_FLAME_HIGHER_IS_DANGER
+    system_state.flame_warning =
+        system_state.flame_connected &&
+        system_state.flame_raw >= thresholds.flame_warning_level;
+#else
+    system_state.flame_warning =
+        system_state.flame_connected &&
+        system_state.flame_raw <= thresholds.flame_warning_level;
+#endif
+
+    system_state.heat_index_warning =
+        system_state.dht_connected &&
+        system_state.heat_index_c >= (float)thresholds.heat_index_warning_level;
+
+    system_state.distance_warning =
+        system_state.ultrasonic_connected &&
+        system_state.distance_cm <= (float)thresholds.distance_warning_cm;
+
+    /*
+     * Alarm is the buzzer condition.
+     * If any warning is active, the buzzer should sound.
+     */
+    system_state.alarm_active =
+        system_state.gas_warning ||
+        system_state.flame_warning ||
+        system_state.heat_index_warning ||
+        system_state.distance_warning;
+}
+
+void app_system_init(void)
+{
+    memset(&system_state, 0, sizeof(system_state));
+
+    system_state.system_alive = true;
+    system_state.wifi_connected = false;
+
+    system_state.gas_connected = false;
+    system_state.flame_connected = false;
+    system_state.dht_connected = false;
+    system_state.ultrasonic_connected = false;
+
+    system_state.gas_raw = 0;
+    system_state.flame_raw = 0;
+
+    system_state.temperature_c = 0.0f;
+    system_state.humidity_percent = 0.0f;
+    system_state.heat_index_c = 0.0f;
+    system_state.distance_cm = 999.0f;
+
+    load_thresholds_from_nvs();
+    load_pins_from_nvs();
+
+    app_system_evaluate_warnings();
+}
+
+void app_system_update_sensors(
+    int gas_raw,
+    int flame_raw,
+    float temperature_c,
+    float humidity_percent,
+    float distance_cm
+)
+{
+    system_state.gas_raw = gas_raw;
+    system_state.flame_raw = flame_raw;
+    system_state.temperature_c = temperature_c;
+    system_state.humidity_percent = humidity_percent;
+    system_state.distance_cm = distance_cm;
+
+    system_state.update_count++;
+
+    app_system_evaluate_warnings();
+}
+
+void app_system_set_wifi_connected(bool connected)
+{
+    system_state.wifi_connected = connected;
+}
+
+void app_system_update_sensor_connections(
+    bool gas_connected,
+    bool flame_connected,
+    bool dht_connected,
+    bool ultrasonic_connected
+)
+{
+    system_state.gas_connected = gas_connected;
+    system_state.flame_connected = flame_connected;
+    system_state.dht_connected = dht_connected;
+    system_state.ultrasonic_connected = ultrasonic_connected;
+
+    app_system_evaluate_warnings();
+}
+
+const app_system_state_t *app_system_get_state(void)
+{
+    return &system_state;
+}
+
+bool app_system_is_alarm_active(void)
+{
+    return system_state.alarm_active;
+}
+
+const app_system_thresholds_t *app_system_get_thresholds(void)
+{
+    return &thresholds;
+}
+
+bool app_system_set_thresholds(const app_system_thresholds_t *new_thresholds)
+{
+    if (new_thresholds == NULL) {
+        return false;
+    }
+
+    if (new_thresholds->gas_warning_level < 0 || new_thresholds->gas_warning_level > 1023) {
+        return false;
+    }
+
+    if (new_thresholds->flame_warning_level < 0 || new_thresholds->flame_warning_level > 1023) {
+        return false;
+    }
+
+    if (new_thresholds->heat_index_warning_level < 0 || new_thresholds->heat_index_warning_level > 100) {
+        return false;
+    }
+
+    if (new_thresholds->distance_warning_cm < 0 || new_thresholds->distance_warning_cm > 500) {
+        return false;
+    }
+
+    if (!save_thresholds_to_nvs(new_thresholds)) {
+        ESP_LOGE(TAG, "Failed to save thresholds to NVS");
+        return false;
+    }
+
+    thresholds = *new_thresholds;
+
+    app_system_evaluate_warnings();
+
+    ESP_LOGI(
+        TAG,
+        "Thresholds updated: gas=%d flame=%d heat_index=%d distance=%d",
+        thresholds.gas_warning_level,
+        thresholds.flame_warning_level,
+        thresholds.heat_index_warning_level,
+        thresholds.distance_warning_cm
+    );
+
+    return true;
+}
+
+const app_system_pin_config_t *app_system_get_pins(void)
+{
+    return &pin_config;
+}
+
+bool app_system_set_pins(const app_system_pin_config_t *pins)
+{
+    if (!pin_config_is_valid(pins)) {
+        ESP_LOGE(TAG, "Invalid pin configuration");
+        return false;
+    }
+
+    if (!save_pins_to_nvs(pins)) {
+        ESP_LOGE(TAG, "Failed to save pin configuration to NVS");
+        return false;
+    }
+
+    pin_config = *pins;
+
+    ESP_LOGI(
+        TAG,
+        "Pins updated: gas_adc=%d flame_adc=%d dht=%d trig=%d echo=%d led_gas=%d led_flame=%d led_heat=%d led_dist=%d buzzer=%d",
+        pin_config.gas_adc_channel,
+        pin_config.flame_adc_channel,
+        pin_config.dht_gpio,
+        pin_config.ultrasonic_trig_gpio,
+        pin_config.ultrasonic_echo_gpio,
+        pin_config.led_gas_gpio,
+        pin_config.led_flame_gpio,
+        pin_config.led_heat_index_gpio,
+        pin_config.led_distance_gpio,
+        pin_config.buzzer_gpio
+    );
+
+    return true;
+}
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_system\component.mk =====
+COMPONENT_SRCDIRS := .
+COMPONENT_ADD_INCLUDEDIRS := include
+
+COMPONENT_REQUIRES := nvs_flash app_config
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_system\include\app_system.h =====
+#ifndef APP_SYSTEM_H
+#define APP_SYSTEM_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+typedef struct
+{
+    int gas_raw;
+    int flame_raw;
+
+    float temperature_c;
+    float humidity_percent;
+    float heat_index_c;
+    float distance_cm;
+
+    bool wifi_connected;
+    bool system_alive;
+
+    bool gas_connected;
+    bool flame_connected;
+    bool dht_connected;
+    bool ultrasonic_connected;
+
+    bool gas_warning;
+    bool flame_warning;
+    bool heat_index_warning;
+    bool distance_warning;
+
+    /*
+     * alarm_active means buzzer alarm.
+     * It is not an alarm LED.
+     */
+    bool alarm_active;
+
+    uint32_t update_count;
+} app_system_state_t;
+
+typedef struct
+{
+    int gas_warning_level;
+    int flame_warning_level;
+    int heat_index_warning_level;
+    int distance_warning_cm;
+} app_system_thresholds_t;
+
+typedef struct
+{
+    int gas_adc_channel;
+    int flame_adc_channel;
+
+    int dht_gpio;
+    int ultrasonic_trig_gpio;
+    int ultrasonic_echo_gpio;
+
+    int led_gas_gpio;
+    int led_flame_gpio;
+    int led_heat_index_gpio;
+    int led_distance_gpio;
+
+    int buzzer_gpio;
+} app_system_pin_config_t;
+
+void app_system_init(void);
+
+void app_system_update_sensors(
+    int gas_raw,
+    int flame_raw,
+    float temperature_c,
+    float humidity_percent,
+    float distance_cm
+);
+
+void app_system_set_wifi_connected(bool connected);
+
+void app_system_update_sensor_connections(
+    bool gas_connected,
+    bool flame_connected,
+    bool dht_connected,
+    bool ultrasonic_connected
+);
+
+const app_system_state_t *app_system_get_state(void);
+
+bool app_system_is_alarm_active(void);
+
+const app_system_thresholds_t *app_system_get_thresholds(void);
+
+bool app_system_set_thresholds(const app_system_thresholds_t *thresholds);
+
+const app_system_pin_config_t *app_system_get_pins(void);
+
+bool app_system_set_pins(const app_system_pin_config_t *pins);
+
+#endif
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_webserver\app_webserver.c =====
+#include "app_webserver.h"
+#include "app_system.h"
+#include "app_config.h"
+#include "app_wifi.h"
+#include "app_auth.h"
+#include "app_outputs.h"
+#include "json_min.h"
+
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_spiffs.h"
+#include "esp_system.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdlib.h>
+
+static const char *TAG = "APP_WEBSERVER";
+
+static httpd_handle_t server = NULL;
+static bool spiffs_ready = false;
+
+#define MAX_REQUEST_BODY_SIZE   512
+#define COOKIE_HEADER_MAX_LEN   128
+
+static void format_float_1(float value, char *out, size_t out_size)
+{
+    bool negative = false;
+
+    if (value < 0) {
+        negative = true;
+        value = -value;
+    }
+
+    int value10 = (int)(value * 10.0f + 0.5f);
+    int whole = value10 / 10;
+    int tenth = value10 % 10;
+
+    if (negative) {
+        snprintf(out, out_size, "-%d.%d", whole, tenth);
+    } else {
+        snprintf(out, out_size, "%d.%d", whole, tenth);
+    }
+}
+
+static void gpio_to_label(int gpio, char *out, size_t out_size)
+{
+    const char *label = NULL;
+
+    switch (gpio) {
+        case 16: label = "D0"; break;
+        case 5:  label = "D1"; break;
+        case 4:  label = "D2"; break;
+        case 0:  label = "D3"; break;
+        case 2:  label = "D4"; break;
+        case 14: label = "D5"; break;
+        case 12: label = "D6"; break;
+        case 13: label = "D7"; break;
+        case 15: label = "D8"; break;
+        default: label = NULL; break;
+    }
+
+    if (label != NULL) {
+        snprintf(out, out_size, "%s", label);
+    } else {
+        snprintf(out, out_size, "GPIO%d", gpio);
+    }
+}
+
+static bool label_to_gpio(const char *label, int *out_gpio)
+{
+    if (label == NULL || out_gpio == NULL) {
+        return false;
+    }
+
+    if (strcmp(label, "D0") == 0) { *out_gpio = 16; return true; }
+    if (strcmp(label, "D1") == 0) { *out_gpio = 5;  return true; }
+    if (strcmp(label, "D2") == 0) { *out_gpio = 4;  return true; }
+    if (strcmp(label, "D3") == 0) { *out_gpio = 0;  return true; }
+    if (strcmp(label, "D4") == 0) { *out_gpio = 2;  return true; }
+    if (strcmp(label, "D5") == 0) { *out_gpio = 14; return true; }
+    if (strcmp(label, "D6") == 0) { *out_gpio = 12; return true; }
+    if (strcmp(label, "D7") == 0) { *out_gpio = 13; return true; }
+    if (strcmp(label, "D8") == 0) { *out_gpio = 15; return true; }
+
+    if (strncmp(label, "GPIO", 4) == 0) {
+        *out_gpio = atoi(label + 4);
+        return true;
+    }
+
+    if (label[0] >= '0' && label[0] <= '9') {
+        *out_gpio = atoi(label);
+        return true;
+    }
+
+    return false;
+}
+
+static bool label_to_adc_channel(const char *label, int *out_channel)
+{
+    if (label == NULL || out_channel == NULL) {
+        return false;
+    }
+
+    if (strcmp(label, "A0") == 0) {
+        *out_channel = 0;
+        return true;
+    }
+
+    if (strncmp(label, "ADC", 3) == 0) {
+        *out_channel = atoi(label + 3);
+        return true;
+    }
+
+    if (label[0] >= '0' && label[0] <= '9') {
+        *out_channel = atoi(label);
+        return true;
+    }
+
+    return false;
+}
+
+static void adc_to_label(int channel, char *out, size_t out_size)
+{
+    if (channel == 0) {
+        snprintf(out, out_size, "A0");
+    } else {
+        snprintf(out, out_size, "ADC%d", channel);
+    }
+}
+
+static bool get_gpio_from_json(
+    const char *body,
+    const char *int_key,
+    const char *string_key,
+    int *out_value
+)
+{
+    int value;
+
+    if (json_min_get_int(body, int_key, &value)) {
+        *out_value = value;
+        return true;
+    }
+
+    char text[24];
+
+    if (json_min_get_string(body, string_key, text, sizeof(text))) {
+        return label_to_gpio(text, out_value);
+    }
+
+    return false;
+}
+
+static bool get_adc_from_json(
+    const char *body,
+    const char *int_key,
+    const char *string_key,
+    int *out_value
+)
+{
+    int value;
+
+    if (json_min_get_int(body, int_key, &value)) {
+        *out_value = value;
+        return true;
+    }
+
+    char text[24];
+
+    if (json_min_get_string(body, string_key, text, sizeof(text))) {
+        return label_to_adc_channel(text, out_value);
+    }
+
+    return false;
+}
+
+static void app_spiffs_init(void)
+{
+    ESP_LOGI(TAG, "Mounting SPIFFS");
+
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = "storage",
+        .max_files = 5,
+        .format_if_mount_failed = false
+    };
+
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount SPIFFS");
+        spiffs_ready = false;
+        return;
+    }
+
+    size_t total = 0;
+    size_t used = 0;
+
+    ret = esp_spiffs_info("storage", &total, &used);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "SPIFFS mounted. Total: %u bytes, Used: %u bytes",
+            (unsigned int)total,
+            (unsigned int)used
+        );
+    } else {
+        ESP_LOGW(TAG, "SPIFFS mounted, but failed to get partition info");
+    }
+
+    spiffs_ready = true;
+}
+
+static esp_err_t send_file(httpd_req_t *req, const char *path, const char *content_type)
+{
+    if (!spiffs_ready) {
+        const char *message = "SPIFFS not mounted";
+
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_send(req, message, strlen(message));
+
+        return ESP_FAIL;
+    }
+
+    FILE *file = fopen(path, "rb");
+
+    if (file == NULL) {
+        ESP_LOGW(TAG, "File not found: %s", path);
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, content_type);
+
+    char buffer[256];
+    size_t read_bytes;
+
+    while ((read_bytes = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        esp_err_t ret = httpd_resp_send_chunk(req, buffer, read_bytes);
+
+        if (ret != ESP_OK) {
+            fclose(file);
+            ESP_LOGE(TAG, "File sending failed: %s", path);
+            return ret;
+        }
+    }
+
+    fclose(file);
+
+    httpd_resp_send_chunk(req, NULL, 0);
+
+    return ESP_OK;
+}
+
+static bool read_request_body(httpd_req_t *req, char *out_buf, size_t out_buf_size)
+{
+    if (req->content_len == 0 || req->content_len >= out_buf_size) {
+        return false;
+    }
+
+    size_t total_read = 0;
+
+    while (total_read < req->content_len) {
+        int ret = httpd_req_recv(req, out_buf + total_read, req->content_len - total_read);
+
+        if (ret <= 0) {
+            return false;
+        }
+
+        total_read += (size_t)ret;
+    }
+
+    out_buf[total_read] = '\0';
+    return true;
+}
+
+static void send_json_response(httpd_req_t *req, int status_code, const char *json_body)
+{
+    switch (status_code) {
+        case 200:
+            httpd_resp_set_status(req, "200 OK");
+            break;
+        case 400:
+            httpd_resp_set_status(req, "400 Bad Request");
+            break;
+        case 401:
+            httpd_resp_set_status(req, "401 Unauthorized");
+            break;
+        case 409:
+            httpd_resp_set_status(req, "409 Conflict");
+            break;
+        case 500:
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            break;
+        default:
+            httpd_resp_set_status(req, "200 OK");
+            break;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_body, strlen(json_body));
+}
+
+static void send_json_error(httpd_req_t *req, int status_code, const char *message)
+{
+    char body[160];
+    snprintf(body, sizeof(body), "{\"error\":\"%s\"}", message);
+    send_json_response(req, status_code, body);
+}
+
+static void json_escape_string(const char *input, char *output, size_t output_size)
+{
+    if (output == NULL || output_size == 0) {
+        return;
+    }
+
+    output[0] = '\0';
+
+    if (input == NULL) {
+        return;
+    }
+
+    size_t out = 0;
+
+    for (size_t i = 0; input[i] != '\0' && out < output_size - 1; i++) {
+        char ch = input[i];
+
+        if (ch == '"' || ch == '\\') {
+            if (out + 2 >= output_size) {
+                break;
+            }
+
+            output[out++] = '\\';
+            output[out++] = ch;
+        } else if ((unsigned char)ch < 0x20) {
+            continue;
+        } else {
+            output[out++] = ch;
+        }
+    }
+
+    output[out] = '\0';
+}
+
+static void register_uri_checked(httpd_uri_t *uri)
+{
+    esp_err_t err = httpd_register_uri_handler(server, uri);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register URI %s (err=%d)", uri->uri, err);
+    }
+}
+
+static bool require_auth(httpd_req_t *req, char *out_email, size_t out_email_size)
+{
+    size_t cookie_len = httpd_req_get_hdr_value_len(req, "Cookie");
+
+    if (cookie_len == 0 || cookie_len >= COOKIE_HEADER_MAX_LEN) {
+        send_json_error(req, 401, "Login required");
+        return false;
+    }
+
+    char cookie_header[COOKIE_HEADER_MAX_LEN];
+
+    if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_header, sizeof(cookie_header)) != ESP_OK) {
+        send_json_error(req, 401, "Login required");
+        return false;
+    }
+
+    char token[APP_AUTH_TOKEN_LEN + 1];
+
+    if (!app_auth_extract_token_from_cookie(cookie_header, token, sizeof(token))) {
+        send_json_error(req, 401, "Login required");
+        return false;
+    }
+
+    if (!app_auth_session_is_valid(token, out_email, out_email_size)) {
+        send_json_error(req, 401, "Session expired, please log in again");
+        return false;
+    }
+
+    return true;
+}
+
+/* ---------- Static files ---------- */
+
+static esp_err_t root_handler(httpd_req_t *req)
+{
+    return send_file(req, "/spiffs/index.html", "text/html");
+}
+
+static esp_err_t css_handler(httpd_req_t *req)
+{
+    return send_file(req, "/spiffs/style.css", "text/css");
+}
+
+static esp_err_t js_handler(httpd_req_t *req)
+{
+    return send_file(req, "/spiffs/app.js", "application/javascript");
+}
+
+/* ---------- /api/status ---------- */
+
+static esp_err_t status_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    const app_system_state_t *state = app_system_get_state();
+
+    char temp_text[16];
+    char humidity_text[16];
+    char heat_index_text[16];
+    char distance_text[16];
+
+    format_float_1(state->temperature_c, temp_text, sizeof(temp_text));
+    format_float_1(state->humidity_percent, humidity_text, sizeof(humidity_text));
+    format_float_1(state->heat_index_c, heat_index_text, sizeof(heat_index_text));
+    format_float_1(state->distance_cm, distance_text, sizeof(distance_text));
+
+    char json[1300];
+
+    snprintf(
+        json,
+        sizeof(json),
+        "{"
+        "\"gas_raw\":%d,"
+        "\"flame_raw\":%d,"
+        "\"temperature_c\":%s,"
+        "\"humidity_percent\":%s,"
+        "\"heat_index_c\":%s,"
+        "\"distance_cm\":%s,"
+
+        "\"wifi_connected\":%s,"
+        "\"system_alive\":%s,"
+
+        "\"gas_connected\":%s,"
+        "\"flame_connected\":%s,"
+        "\"dht_connected\":%s,"
+        "\"ultrasonic_connected\":%s,"
+
+        "\"gas_warning\":%s,"
+        "\"flame_warning\":%s,"
+        "\"heat_index_warning\":%s,"
+        "\"distance_warning\":%s,"
+
+        "\"alarm_active\":%s,"
+        "\"update_count\":%u,"
+
+        "\"outputs\":{"
+            "\"led_gas\":%s,"
+            "\"led_flame\":%s,"
+            "\"led_heat_index\":%s,"
+            "\"led_distance\":%s,"
+            "\"buzzer\":%s"
+        "}"
+        "}",
+        state->gas_raw,
+        state->flame_raw,
+        temp_text,
+        humidity_text,
+        heat_index_text,
+        distance_text,
+
+        state->wifi_connected ? "true" : "false",
+        state->system_alive ? "true" : "false",
+
+        state->gas_connected ? "true" : "false",
+        state->flame_connected ? "true" : "false",
+        state->dht_connected ? "true" : "false",
+        state->ultrasonic_connected ? "true" : "false",
+
+        state->gas_warning ? "true" : "false",
+        state->flame_warning ? "true" : "false",
+        state->heat_index_warning ? "true" : "false",
+        state->distance_warning ? "true" : "false",
+
+        state->alarm_active ? "true" : "false",
+        state->update_count,
+
+        state->gas_warning ? "true" : "false",
+        state->flame_warning ? "true" : "false",
+        state->heat_index_warning ? "true" : "false",
+        state->distance_warning ? "true" : "false",
+        state->alarm_active ? "true" : "false"
+    );
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+
+    return ESP_OK;
+}
+
+/* ---------- Auth ---------- */
+
+static esp_err_t auth_register_handler(httpd_req_t *req)
+{
+    char body[MAX_REQUEST_BODY_SIZE];
+
+    if (!read_request_body(req, body, sizeof(body))) {
+        send_json_error(req, 400, "Request body missing or too large");
+        return ESP_OK;
+    }
+
+    char name[APP_AUTH_NAME_MAX];
+    char email[APP_AUTH_USERNAME_MAX];
+    char password[128];
+
+    bool have_name = json_min_get_string(body, "name", name, sizeof(name));
+    bool have_email = json_min_get_string(body, "email", email, sizeof(email));
+    bool have_password = json_min_get_string(body, "password", password, sizeof(password));
+
+    if (!have_email || !have_password) {
+        send_json_error(req, 400, "Email and password are required");
+        return ESP_OK;
+    }
+
+    if (!have_name) {
+        name[0] = '\0';
+    }
+
+    app_auth_result_t result = app_auth_register(name, email, password);
+
+    switch (result) {
+        case APP_AUTH_OK:
+            send_json_response(req, 200, "{\"ok\":true}");
+            break;
+        case APP_AUTH_ERR_EXISTS:
+            send_json_error(req, 409, "An account with that email already exists");
+            break;
+        case APP_AUTH_ERR_INVALID_INPUT:
+            send_json_error(req, 400, "Invalid name, email, or password");
+            break;
+        default:
+            send_json_error(req, 500, "Registration failed, please try again");
+            break;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t auth_login_handler(httpd_req_t *req)
+{
+    char body[MAX_REQUEST_BODY_SIZE];
+
+    if (!read_request_body(req, body, sizeof(body))) {
+        send_json_error(req, 400, "Request body missing or too large");
+        return ESP_OK;
+    }
+
+    char email[APP_AUTH_USERNAME_MAX];
+    char password[128];
+
+    if (!json_min_get_string(body, "email", email, sizeof(email)) ||
+        !json_min_get_string(body, "password", password, sizeof(password))) {
+        send_json_error(req, 400, "Email and password are required");
+        return ESP_OK;
+    }
+
+    char token[APP_AUTH_TOKEN_LEN + 1];
+    app_auth_result_t result = app_auth_login(email, password, token);
+
+    if (result != APP_AUTH_OK) {
+        send_json_error(req, 401, "Incorrect email or password");
+        return ESP_OK;
+    }
+
+    char cookie_header[96];
+    snprintf(cookie_header, sizeof(cookie_header), "session=%s; Path=/; HttpOnly", token);
+    httpd_resp_set_hdr(req, "Set-Cookie", cookie_header);
+
+    send_json_response(req, 200, "{\"ok\":true}");
+
+    return ESP_OK;
+}
+
+static esp_err_t auth_logout_handler(httpd_req_t *req)
+{
+    size_t cookie_len = httpd_req_get_hdr_value_len(req, "Cookie");
+
+    if (cookie_len > 0 && cookie_len < COOKIE_HEADER_MAX_LEN) {
+        char cookie_header[COOKIE_HEADER_MAX_LEN];
+
+        if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_header, sizeof(cookie_header)) == ESP_OK) {
+            char token[APP_AUTH_TOKEN_LEN + 1];
+
+            if (app_auth_extract_token_from_cookie(cookie_header, token, sizeof(token))) {
+                app_auth_logout(token);
+            }
+        }
+    }
+
+    httpd_resp_set_hdr(req, "Set-Cookie", "session=; Path=/; HttpOnly; Max-Age=0");
+    send_json_response(req, 200, "{\"ok\":true}");
+
+    return ESP_OK;
+}
+
+static esp_err_t auth_me_handler(httpd_req_t *req)
+{
+    size_t cookie_len = httpd_req_get_hdr_value_len(req, "Cookie");
+
+    if (cookie_len == 0 || cookie_len >= COOKIE_HEADER_MAX_LEN) {
+        send_json_error(req, 401, "Login required");
+        return ESP_OK;
+    }
+
+    char cookie_header[COOKIE_HEADER_MAX_LEN];
+
+    if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_header, sizeof(cookie_header)) != ESP_OK) {
+        send_json_error(req, 401, "Login required");
+        return ESP_OK;
+    }
+
+    char token[APP_AUTH_TOKEN_LEN + 1];
+
+    if (!app_auth_extract_token_from_cookie(cookie_header, token, sizeof(token))) {
+        send_json_error(req, 401, "Login required");
+        return ESP_OK;
+    }
+
+    char email[APP_AUTH_USERNAME_MAX];
+    char name[APP_AUTH_NAME_MAX];
+
+    if (!app_auth_session_get_user(token, email, sizeof(email), name, sizeof(name))) {
+        send_json_error(req, 401, "Session expired, please log in again");
+        return ESP_OK;
+    }
+
+    char safe_email[APP_AUTH_USERNAME_MAX * 2];
+    char safe_name[APP_AUTH_NAME_MAX * 2];
+
+    json_escape_string(email, safe_email, sizeof(safe_email));
+    json_escape_string(name, safe_name, sizeof(safe_name));
+
+    char json[320];
+
+    snprintf(
+        json,
+        sizeof(json),
+        "{\"ok\":true,\"email\":\"%s\",\"name\":\"%s\"}",
+        safe_email,
+        safe_name
+    );
+
+    send_json_response(req, 200, json);
+
+    return ESP_OK;
+}
+
+/* ---------- Wi-Fi ---------- */
+
+static esp_err_t wifi_scan_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    app_wifi_scan_result_t results[APP_WIFI_SCAN_MAX_RESULTS];
+    int count = 0;
+
+    if (!app_wifi_scan(results, &count)) {
+        send_json_error(req, 500, "Wi-Fi scan failed");
+        return ESP_OK;
+    }
+
+    char json[2048];
+    size_t offset = 0;
+
+    offset += snprintf(json + offset, sizeof(json) - offset, "{\"networks\":[");
+
+    for (int i = 0; i < count && offset < sizeof(json) - 1; i++) {
+        const char *auth_name = "unknown";
+
+        switch (results[i].auth_mode) {
+            case 0: auth_name = "open"; break;
+            case 1: auth_name = "wep"; break;
+            case 2: auth_name = "wpa_psk"; break;
+            case 3: auth_name = "wpa2_psk"; break;
+            case 4: auth_name = "wpa_wpa2_psk"; break;
+            default: auth_name = "secured"; break;
+        }
+
+        char safe_ssid[APP_WIFI_SSID_MAX_LEN * 2];
+        size_t safe_offset = 0;
+
+        for (size_t c = 0; results[i].ssid[c] != '\0' && safe_offset < sizeof(safe_ssid) - 2; c++) {
+            if (results[i].ssid[c] == '"' || results[i].ssid[c] == '\\') {
+                safe_ssid[safe_offset++] = '\\';
+            }
+
+            safe_ssid[safe_offset++] = results[i].ssid[c];
+        }
+
+        safe_ssid[safe_offset] = '\0';
+
+        offset += snprintf(
+            json + offset,
+            sizeof(json) - offset,
+            "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":\"%s\"}",
+            (i == 0) ? "" : ",",
+            safe_ssid,
+            results[i].rssi,
+            auth_name
+        );
+    }
+
+    snprintf(json + offset, sizeof(json) - offset, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+
+    return ESP_OK;
+}
+
+static esp_err_t wifi_connect_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    char body[MAX_REQUEST_BODY_SIZE];
+
+    if (!read_request_body(req, body, sizeof(body))) {
+        send_json_error(req, 400, "Request body missing or too large");
+        return ESP_OK;
+    }
+
+    char ssid[APP_WIFI_SSID_MAX_LEN];
+    char password[64];
+
+    if (!json_min_get_string(body, "ssid", ssid, sizeof(ssid))) {
+        send_json_error(req, 400, "SSID is required");
+        return ESP_OK;
+    }
+
+    bool have_password = json_min_get_string(body, "password", password, sizeof(password));
+
+    if (!app_wifi_connect(ssid, have_password ? password : NULL)) {
+        send_json_error(req, 500, "Failed to start Wi-Fi connection");
+        return ESP_OK;
+    }
+
+    send_json_response(req, 200, "{\"ok\":true}");
+
+    return ESP_OK;
+}
+
+/* ---------- Thresholds ---------- */
+
+static esp_err_t thresholds_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    char body[MAX_REQUEST_BODY_SIZE];
+
+    if (!read_request_body(req, body, sizeof(body))) {
+        send_json_error(req, 400, "Request body missing or too large");
+        return ESP_OK;
+    }
+
+    app_system_thresholds_t new_thresholds;
+    const app_system_thresholds_t *current = app_system_get_thresholds();
+
+    new_thresholds = *current;
+
+    bool any_field_present = false;
+    int value;
+
+    if (json_min_get_int(body, "gas_warning_level", &value)) {
+        new_thresholds.gas_warning_level = value;
+        any_field_present = true;
+    }
+
+    if (json_min_get_int(body, "flame_warning_level", &value)) {
+        new_thresholds.flame_warning_level = value;
+        any_field_present = true;
+    }
+
+    if (json_min_get_int(body, "heat_index_warning_level", &value)) {
+        new_thresholds.heat_index_warning_level = value;
+        any_field_present = true;
+    }
+
+    if (json_min_get_int(body, "distance_warning_cm", &value)) {
+        new_thresholds.distance_warning_cm = value;
+        any_field_present = true;
+    }
+
+    /*
+     * Backward compatibility:
+     * If old UI still sends temp_warning_level, use it as heat index level.
+     */
+    if (json_min_get_int(body, "temp_warning_level", &value)) {
+        new_thresholds.heat_index_warning_level = value;
+        any_field_present = true;
+    }
+
+    if (!any_field_present) {
+        send_json_error(req, 400, "No valid threshold fields provided");
+        return ESP_OK;
+    }
+
+    if (!app_system_set_thresholds(&new_thresholds)) {
+        send_json_error(req, 400, "One or more threshold values are out of range");
+        return ESP_OK;
+    }
+
+    send_json_response(req, 200, "{\"ok\":true}");
+
+    return ESP_OK;
+}
+
+/* ---------- Pin configuration ---------- */
+
+static esp_err_t pins_get_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    const app_system_pin_config_t *pins = app_system_get_pins();
+
+    char gas_adc_label[16];
+    char flame_adc_label[16];
+
+    char dht_label[16];
+    char trig_label[16];
+    char echo_label[16];
+
+    char led_gas_label[16];
+    char led_flame_label[16];
+    char led_heat_label[16];
+    char led_distance_label[16];
+
+    char buzzer_label[16];
+
+    adc_to_label(pins->gas_adc_channel, gas_adc_label, sizeof(gas_adc_label));
+    adc_to_label(pins->flame_adc_channel, flame_adc_label, sizeof(flame_adc_label));
+
+    gpio_to_label(pins->dht_gpio, dht_label, sizeof(dht_label));
+    gpio_to_label(pins->ultrasonic_trig_gpio, trig_label, sizeof(trig_label));
+    gpio_to_label(pins->ultrasonic_echo_gpio, echo_label, sizeof(echo_label));
+
+    gpio_to_label(pins->led_gas_gpio, led_gas_label, sizeof(led_gas_label));
+    gpio_to_label(pins->led_flame_gpio, led_flame_label, sizeof(led_flame_label));
+    gpio_to_label(pins->led_heat_index_gpio, led_heat_label, sizeof(led_heat_label));
+    gpio_to_label(pins->led_distance_gpio, led_distance_label, sizeof(led_distance_label));
+
+    gpio_to_label(pins->buzzer_gpio, buzzer_label, sizeof(buzzer_label));
+
+    char json[900];
+
+    snprintf(
+        json,
+        sizeof(json),
+        "{"
+        "\"pins\":{"
+            "\"gas_adc_channel\":%d,"
+            "\"flame_adc_channel\":%d,"
+            "\"dht_gpio\":%d,"
+            "\"ultrasonic_trig_gpio\":%d,"
+            "\"ultrasonic_echo_gpio\":%d,"
+            "\"led_gas_gpio\":%d,"
+            "\"led_flame_gpio\":%d,"
+            "\"led_heat_index_gpio\":%d,"
+            "\"led_distance_gpio\":%d,"
+            "\"buzzer_gpio\":%d,"
+
+            "\"gas_adc\":\"%s\","
+            "\"flame_adc\":\"%s\","
+            "\"dht_data\":\"%s\","
+            "\"ultrasonic_trig\":\"%s\","
+            "\"ultrasonic_echo\":\"%s\","
+            "\"led_gas\":\"%s\","
+            "\"led_flame\":\"%s\","
+            "\"led_heat_index\":\"%s\","
+            "\"led_distance\":\"%s\","
+            "\"buzzer\":\"%s\""
+        "}"
+        "}",
+        pins->gas_adc_channel,
+        pins->flame_adc_channel,
+        pins->dht_gpio,
+        pins->ultrasonic_trig_gpio,
+        pins->ultrasonic_echo_gpio,
+        pins->led_gas_gpio,
+        pins->led_flame_gpio,
+        pins->led_heat_index_gpio,
+        pins->led_distance_gpio,
+        pins->buzzer_gpio,
+
+        gas_adc_label,
+        flame_adc_label,
+        dht_label,
+        trig_label,
+        echo_label,
+        led_gas_label,
+        led_flame_label,
+        led_heat_label,
+        led_distance_label,
+        buzzer_label
+    );
+
+    send_json_response(req, 200, json);
+
+    return ESP_OK;
+}
+
+static esp_err_t pins_post_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    char body[MAX_REQUEST_BODY_SIZE];
+
+    if (!read_request_body(req, body, sizeof(body))) {
+        send_json_error(req, 400, "Request body missing or too large");
+        return ESP_OK;
+    }
+
+    app_system_pin_config_t new_pins;
+    const app_system_pin_config_t *current = app_system_get_pins();
+
+    new_pins = *current;
+
+    get_adc_from_json(body, "gas_adc_channel", "gas_adc", &new_pins.gas_adc_channel);
+    get_adc_from_json(body, "flame_adc_channel", "flame_adc", &new_pins.flame_adc_channel);
+
+    get_gpio_from_json(body, "dht_gpio", "dht_data", &new_pins.dht_gpio);
+    get_gpio_from_json(body, "ultrasonic_trig_gpio", "ultrasonic_trig", &new_pins.ultrasonic_trig_gpio);
+    get_gpio_from_json(body, "ultrasonic_echo_gpio", "ultrasonic_echo", &new_pins.ultrasonic_echo_gpio);
+
+    get_gpio_from_json(body, "led_gas_gpio", "led_gas", &new_pins.led_gas_gpio);
+    get_gpio_from_json(body, "led_flame_gpio", "led_flame", &new_pins.led_flame_gpio);
+    get_gpio_from_json(body, "led_heat_index_gpio", "led_heat_index", &new_pins.led_heat_index_gpio);
+    get_gpio_from_json(body, "led_distance_gpio", "led_distance", &new_pins.led_distance_gpio);
+
+    get_gpio_from_json(body, "buzzer_gpio", "buzzer", &new_pins.buzzer_gpio);
+
+    if (!app_system_set_pins(&new_pins)) {
+        send_json_error(req, 400, "Invalid pin configuration");
+        return ESP_OK;
+    }
+
+    send_json_response(req, 200, "{\"ok\":true}");
+
+    return ESP_OK;
+}
+
+/* ---------- Commands ---------- */
+
+static void restart_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+static esp_err_t alarm_test_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    app_outputs_set_buzzer(true);
+    vTaskDelay(pdMS_TO_TICKS(800));
+    app_outputs_set_buzzer(false);
+
+    send_json_response(req, 200, "{\"ok\":true}");
+
+    return ESP_OK;
+}
+
+static esp_err_t system_restart_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    send_json_response(req, 200, "{\"ok\":true}");
+
+    xTaskCreate(restart_task, "restart_task", 1024, NULL, 5, NULL);
+
+    return ESP_OK;
+}
+
+/* ---------- Server setup ---------- */
+
+void app_webserver_init(void)
+{
+    app_spiffs_init();
+
+    if (spiffs_ready) {
+        app_auth_init();
+    }
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 24;
+    config.stack_size = 6144;
+
+    ESP_LOGI(TAG, "Starting web server");
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_handler, .user_ctx = NULL };
+        httpd_uri_t css_uri = { .uri = "/style.css", .method = HTTP_GET, .handler = css_handler, .user_ctx = NULL };
+        httpd_uri_t js_uri = { .uri = "/app.js", .method = HTTP_GET, .handler = js_handler, .user_ctx = NULL };
+        httpd_uri_t status_uri = { .uri = "/api/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL };
+
+        httpd_uri_t register_uri = { .uri = "/api/auth/register", .method = HTTP_POST, .handler = auth_register_handler, .user_ctx = NULL };
+        httpd_uri_t login_uri = { .uri = "/api/auth/login", .method = HTTP_POST, .handler = auth_login_handler, .user_ctx = NULL };
+        httpd_uri_t logout_uri = { .uri = "/api/auth/logout", .method = HTTP_POST, .handler = auth_logout_handler, .user_ctx = NULL };
+        httpd_uri_t me_uri = { .uri = "/api/auth/me", .method = HTTP_GET, .handler = auth_me_handler, .user_ctx = NULL };
+
+        httpd_uri_t wifi_scan_uri = { .uri = "/api/wifi/scan", .method = HTTP_GET, .handler = wifi_scan_handler, .user_ctx = NULL };
+        httpd_uri_t wifi_connect_uri = { .uri = "/api/wifi/connect", .method = HTTP_POST, .handler = wifi_connect_handler, .user_ctx = NULL };
+
+        httpd_uri_t thresholds_uri = { .uri = "/api/config/thresholds", .method = HTTP_POST, .handler = thresholds_handler, .user_ctx = NULL };
+
+        httpd_uri_t pins_get_uri = { .uri = "/api/config/pins", .method = HTTP_GET, .handler = pins_get_handler, .user_ctx = NULL };
+        httpd_uri_t pins_post_uri = { .uri = "/api/config/pins", .method = HTTP_POST, .handler = pins_post_handler, .user_ctx = NULL };
+
+        httpd_uri_t alarm_test_uri = { .uri = "/api/alarm/test", .method = HTTP_POST, .handler = alarm_test_handler, .user_ctx = NULL };
+        httpd_uri_t restart_uri = { .uri = "/api/system/restart", .method = HTTP_POST, .handler = system_restart_handler, .user_ctx = NULL };
+
+        register_uri_checked(&root_uri);
+        register_uri_checked(&css_uri);
+        register_uri_checked(&js_uri);
+        register_uri_checked(&status_uri);
+
+        register_uri_checked(&register_uri);
+        register_uri_checked(&login_uri);
+        register_uri_checked(&logout_uri);
+        register_uri_checked(&me_uri);
+
+        register_uri_checked(&wifi_scan_uri);
+        register_uri_checked(&wifi_connect_uri);
+
+        register_uri_checked(&thresholds_uri);
+
+        register_uri_checked(&pins_get_uri);
+        register_uri_checked(&pins_post_uri);
+
+        register_uri_checked(&alarm_test_uri);
+        register_uri_checked(&restart_uri);
+
+        ESP_LOGI(TAG, "Web server started");
+    } else {
+        ESP_LOGE(TAG, "Failed to start web server");
+    }
+}
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_webserver\component.mk =====
+COMPONENT_SRCDIRS := .
+COMPONENT_ADD_INCLUDEDIRS := include
+
+COMPONENT_REQUIRES := esp_http_server app_system app_config app_wifi app_auth app_outputs spiffs vfs
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_webserver\json_min.c =====
+#include "json_min.h"
+
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+
+static const char *skip_ws(const char *p)
+{
+    while (p != NULL && *p != '\0' && isspace((unsigned char)*p)) {
+        p++;
+    }
+
+    return p;
+}
+
+static const char *find_key_value_start(const char *json, const char *key)
+{
+    if (json == NULL || key == NULL) {
+        return NULL;
+    }
+
+    size_t key_len = strlen(key);
+    const char *p = json;
+
+    while ((p = strchr(p, '"')) != NULL) {
+        p++;
+
+        if (strncmp(p, key, key_len) == 0 && p[key_len] == '"') {
+            p += key_len + 1;
+            p = skip_ws(p);
+
+            if (*p == ':') {
+                p++;
+                return skip_ws(p);
+            }
+        }
+
+        /* Move past the current string safely. */
+        while (*p != '\0') {
+            if (*p == '\\' && p[1] != '\0') {
+                p += 2;
+                continue;
+            }
+
+            if (*p == '"') {
+                p++;
+                break;
+            }
+
+            p++;
+        }
+    }
+
+    return NULL;
+}
+
+bool json_min_get_string(const char *json, const char *key, char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0) {
+        return false;
+    }
+
+    out[0] = '\0';
+
+    const char *p = find_key_value_start(json, key);
+
+    if (p == NULL || *p != '"') {
+        return false;
+    }
+
+    p++;
+
+    size_t written = 0;
+
+    while (*p != '\0' && *p != '"') {
+        char ch = *p;
+
+        if (ch == '\\' && p[1] != '\0') {
+            p++;
+
+            switch (*p) {
+                case '"': ch = '"'; break;
+                case '\\': ch = '\\'; break;
+                case '/': ch = '/'; break;
+                case 'n': ch = '\n'; break;
+                case 'r': ch = '\r'; break;
+                case 't': ch = '\t'; break;
+                default: ch = *p; break;
+            }
+        }
+
+        if (written < out_size - 1) {
+            out[written++] = ch;
+        } else {
+            out[0] = '\0';
+            return false;
+        }
+
+        p++;
+    }
+
+    if (*p != '"') {
+        out[0] = '\0';
+        return false;
+    }
+
+    out[written] = '\0';
+    return true;
+}
+
+bool json_min_get_int(const char *json, const char *key, int *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+
+    const char *p = find_key_value_start(json, key);
+
+    if (p == NULL) {
+        return false;
+    }
+
+    char *end = NULL;
+    long value = strtol(p, &end, 10);
+
+    if (end == p) {
+        return false;
+    }
+
+    *out = (int)value;
+    return true;
+}
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_webserver\include\app_webserver.h =====
+#ifndef APP_WEBSERVER_H
+#define APP_WEBSERVER_H
+
+void app_webserver_init(void);
+
+#endif
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_webserver\include\json_min.h =====
+#ifndef JSON_MIN_H
+#define JSON_MIN_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+bool json_min_get_string(const char *json, const char *key, char *out, size_t out_size);
+bool json_min_get_int(const char *json, const char *key, int *out);
+
+#endif
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_wifi\app_wifi.c =====
+#include "app_wifi.h"
+#include "app_config.h"
+
+#include "esp_wifi.h"
+#include "esp_event_loop.h"
+#include "esp_log.h"
+#include "tcpip_adapter.h"
+
+#include <string.h>
+
+static const char *TAG = "APP_WIFI";
+
+static bool wifi_ready = false;
+static int retry_count = 0;
+
+static esp_err_t app_wifi_event_handler(void *ctx, system_event_t *event)
+{
+    switch (event->event_id) {
+        case SYSTEM_EVENT_STA_START:
+            ESP_LOGI(TAG, "Wi-Fi started, connecting...");
+            esp_wifi_connect();
+            break;
+
+        case SYSTEM_EVENT_STA_GOT_IP:
+            wifi_ready = true;
+            retry_count = 0;
+
+            ESP_LOGI(
+                TAG,
+                "Connected to Wi-Fi. IP address: " IPSTR,
+                IP2STR(&event->event_info.got_ip.ip_info.ip)
+            );
+            break;
+
+        case SYSTEM_EVENT_STA_DISCONNECTED:
+            wifi_ready = false;
+
+            if (retry_count < APP_WIFI_MAX_RETRY) {
+                retry_count++;
+                ESP_LOGI(TAG, "Wi-Fi disconnected, retrying... attempt %d", retry_count);
+                esp_wifi_connect();
+            } else {
+                ESP_LOGE(TAG, "Failed to connect to Wi-Fi");
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return ESP_OK;
+}
+
+void app_wifi_init(void)
+{
+    ESP_LOGI(TAG, "Initializing Wi-Fi Station mode");
+
+    tcpip_adapter_init();
+
+    ESP_ERROR_CHECK(esp_event_loop_init(app_wifi_event_handler, NULL));
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_config_t wifi_config;
+    memset(&wifi_config, 0, sizeof(wifi_config));
+
+    strncpy((char *)wifi_config.sta.ssid, APP_WIFI_STA_SSID, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, APP_WIFI_STA_PASSWORD, sizeof(wifi_config.sta.password) - 1);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Connecting to Wi-Fi SSID: %s", APP_WIFI_STA_SSID);
+}
+
+bool app_wifi_is_ready(void)
+{
+    return wifi_ready;
+}
+
+bool app_wifi_scan(app_wifi_scan_result_t *out_results, int *out_count)
+{
+    if (out_results == NULL || out_count == NULL) {
+        return false;
+    }
+
+    *out_count = 0;
+
+    wifi_scan_config_t scan_config;
+    memset(&scan_config, 0, sizeof(scan_config));
+    scan_config.show_hidden = false;
+
+    /*
+     * Blocking scan: simplest to reason about for a request/response HTTP
+     * handler. Scanning briefly interrupts the station's normal traffic,
+     * which is an acceptable tradeoff for a manual "scan networks" action.
+     */
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi scan failed to start (err=%d)", err);
+        return false;
+    }
+
+    uint16_t number = APP_WIFI_SCAN_MAX_RESULTS;
+    wifi_ap_record_t ap_records[APP_WIFI_SCAN_MAX_RESULTS];
+
+    err = esp_wifi_scan_get_ap_records(&number, ap_records);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to retrieve scan results (err=%d)", err);
+        return false;
+    }
+
+    int count = (number < APP_WIFI_SCAN_MAX_RESULTS) ? number : APP_WIFI_SCAN_MAX_RESULTS;
+
+    for (int i = 0; i < count; i++) {
+        strncpy(out_results[i].ssid, (const char *)ap_records[i].ssid, APP_WIFI_SSID_MAX_LEN - 1);
+        out_results[i].ssid[APP_WIFI_SSID_MAX_LEN - 1] = '\0';
+        out_results[i].rssi = ap_records[i].rssi;
+        out_results[i].auth_mode = (int)ap_records[i].authmode;
+    }
+
+    *out_count = count;
+
+    ESP_LOGI(TAG, "Wi-Fi scan found %d network(s)", count);
+
+    return true;
+}
+
+bool app_wifi_connect(const char *ssid, const char *password)
+{
+    if (ssid == NULL || strlen(ssid) == 0 || strlen(ssid) >= sizeof(((wifi_config_t *)0)->sta.ssid)) {
+        ESP_LOGW(TAG, "Invalid SSID for connect request");
+        return false;
+    }
+
+    if (password != NULL && strlen(password) >= sizeof(((wifi_config_t *)0)->sta.password)) {
+        ESP_LOGW(TAG, "Password too long for connect request");
+        return false;
+    }
+
+    wifi_config_t wifi_config;
+    memset(&wifi_config, 0, sizeof(wifi_config));
+
+    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
+
+    if (password != NULL) {
+        strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
+    }
+
+    wifi_ready = false;
+    retry_count = 0;
+
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED) {
+        ESP_LOGW(TAG, "esp_wifi_disconnect returned err=%d (continuing anyway)", err);
+    }
+
+    err = esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set new Wi-Fi config (err=%d)", err);
+        return false;
+    }
+
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start connection attempt (err=%d)", err);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Connecting to new Wi-Fi SSID: %s", ssid);
+
+    return true;
+}
+
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_wifi\component.mk =====
+COMPONENT_SRCDIRS := .
+COMPONENT_ADD_INCLUDEDIRS := include
+
+COMPONENT_REQUIRES := app_config
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_wifi\include\app_wifi.h =====
+#ifndef APP_WIFI_H
+#define APP_WIFI_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#define APP_WIFI_SCAN_MAX_RESULTS  15
+#define APP_WIFI_SSID_MAX_LEN      33  /* 32 chars + null terminator */
+
+typedef struct {
+    char ssid[APP_WIFI_SSID_MAX_LEN];
+    int8_t rssi;
+    int auth_mode; /* matches wifi_auth_mode_t values */
+} app_wifi_scan_result_t;
+
+void app_wifi_init(void);
+
+bool app_wifi_is_ready(void);
+
+/*
+ * Scans for nearby networks (blocking). Writes up to
+ * APP_WIFI_SCAN_MAX_RESULTS into out_results and the actual count into
+ * out_count. Returns false if the scan itself failed to start/complete.
+ */
+bool app_wifi_scan(app_wifi_scan_result_t *out_results, int *out_count);
+
+/*
+ * Reconfigures the station with new credentials and (re)connects.
+ * This does not block waiting for the connection result; call
+ * app_wifi_is_ready() afterward to check connection status.
+ */
+bool app_wifi_connect(const char *ssid, const char *password);
+
+#endif
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\main\component.mk =====
+COMPONENT_SRCDIRS := .
+COMPONENT_ADD_INCLUDEDIRS := .
+
+COMPONENT_REQUIRES := app_wifi app_webserver app_sensors app_system app_outputs app_config nvs_flash
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\main\main.c =====
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_log.h"
+#include "nvs_flash.h"
+
+#include "app_wifi.h"
+#include "app_webserver.h"
+#include "app_sensors.h"
+#include "app_system.h"
+#include "app_outputs.h"
+#include "app_config.h"
+
+static const char *TAG = "MAIN";
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting Underground Helmet System");
+
+    esp_err_t nvs_ret = nvs_flash_init();
+
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES) {
+        ESP_LOGW(TAG, "NVS has no free pages, erasing and reinitializing");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+
+    ESP_ERROR_CHECK(nvs_ret);
+
+    app_system_init();
+    app_outputs_init();
+    app_sensors_init();
+
+    app_wifi_init();
+    app_webserver_init();
+
+    while (1) {
+        app_sensor_data_t sensor_data;
+
+        if (app_sensors_read(&sensor_data)) {
+            app_system_update_sensors(
+                sensor_data.gas_raw,
+                sensor_data.flame_raw,
+                sensor_data.temperature_c,
+                sensor_data.humidity_percent,
+                sensor_data.distance_cm
+            );
+
+            app_system_update_sensor_connections(
+                sensor_data.gas_ok,
+                sensor_data.flame_ok,
+                sensor_data.dht_ok,
+                sensor_data.ultrasonic_ok
+            );
+        } else {
+            app_system_update_sensor_connections(false, false, false, false);
+        }
+
+        app_system_set_wifi_connected(app_wifi_is_ready());
+
+        const app_system_state_t *state = app_system_get_state();
+
+        app_outputs_update(state);
+
+        ESP_LOGI(
+            TAG,
+            "Gas=%d Flame=%d Temp=%d Hum=%d HeatIndex=%d Dist=%d Alarm=%s WiFi=%s",
+            state->gas_raw,
+            state->flame_raw,
+            (int)state->temperature_c,
+            (int)state->humidity_percent,
+            (int)state->heat_index_c,
+            (int)state->distance_cm,
+            state->alarm_active ? "ON" : "OFF",
+            state->wifi_connected ? "CONNECTED" : "DISCONNECTED"
+        );
+
+        vTaskDelay(pdMS_TO_TICKS(APP_SENSOR_READ_DELAY_MS));
+    }
+}
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\spiffs\app.js =====
+const pages = document.querySelectorAll(".page");
+const navButtons = document.querySelectorAll(".nav-btn");
+const pageTitle = document.getElementById("pageTitle");
+
+let lastStatus = null;
+let isAuthenticated = false;
+let currentUser = null;
+
+function byId(id) {
+  return document.getElementById(id);
+}
+
+function setText(id, value) {
+  const el = byId(id);
+  if (el) el.textContent = value;
+}
+
+function toNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function percent(value, max) {
+  const n = Math.max(0, Math.min(100, (toNumber(value) / max) * 100));
+  return n.toFixed(0) + "%";
+}
+
+function yesNo(value) {
+  return value ? "YES" : "NO";
+}
+
+function connectedText(value) {
+  return value ? "Connected" : "Not connected";
+}
+
+function formatMaybe(value, decimals, unit, connected) {
+  if (!connected) return "Not connected";
+  const n = toNumber(value);
+  const text = decimals === 1 ? n.toFixed(1) : String(n);
+  return unit ? text + " " + unit : text;
+}
+
+function computeHeatIndexC(tempC, humidity) {
+  const t = toNumber(tempC);
+  const rh = toNumber(humidity);
+
+  if (t < 27 || rh < 40) {
+    return t;
+  }
+
+  const f = (t * 9 / 5) + 32;
+  const hiF =
+    -42.379 +
+    2.04901523 * f +
+    10.14333127 * rh -
+    0.22475541 * f * rh -
+    0.00683783 * f * f -
+    0.05481717 * rh * rh +
+    0.00122874 * f * f * rh +
+    0.00085282 * f * rh * rh -
+    0.00000199 * f * f * rh * rh;
+
+  return (hiF - 32) * 5 / 9;
+}
+
+function getHeatIndex(data, temp, hum) {
+  if (Number.isFinite(Number(data.heat_index_c))) {
+    return toNumber(data.heat_index_c);
+  }
+
+  return computeHeatIndexC(temp, hum);
+}
+
+function setState(id, warning, safeText, warnText) {
+  const el = byId(id);
+  if (!el) return;
+
+  el.textContent = warning ? warnText : safeText;
+  el.className = warning ? "state warn" : "state safe";
+}
+
+function setBar(id, value, max, warning) {
+  const el = byId(id);
+  if (!el) return;
+
+  el.style.width = percent(value, max);
+  el.className = warning ? "meter-fill warning" : "meter-fill";
+}
+
+function setSensorDisplay(valueId, barId, stateId, connected, value, decimals, max, warning, safeText, warnText, offlineText) {
+  if (!connected) {
+    setText(valueId, "--");
+
+    const stateEl = byId(stateId);
+    if (stateEl) {
+      stateEl.textContent = offlineText;
+      stateEl.className = "state offline";
+    }
+
+    const barEl = byId(barId);
+    if (barEl) {
+      barEl.style.width = "0%";
+      barEl.className = "meter-fill offline";
+    }
+
+    return;
+  }
+
+  if (decimals === "1") {
+    setText(valueId, toNumber(value).toFixed(1));
+  } else {
+    setText(valueId, value);
+  }
+
+  setState(stateId, warning, safeText, warnText);
+  setBar(barId, value, max, warning);
+}
+
+function showPage(pageId) {
+  pages.forEach(page => {
+    page.classList.toggle("active", page.id === pageId);
+  });
+
+  navButtons.forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.page === pageId);
+  });
+
+  const activeBtn = document.querySelector(`.nav-btn[data-page="${pageId}"]`);
+  if (activeBtn) pageTitle.textContent = activeBtn.textContent.trim();
+
+  closeMobileNav();
+}
+
+navButtons.forEach(btn => {
+  btn.addEventListener("click", () => showPage(btn.dataset.page));
+});
+
+/* ---------- Mobile nav (hamburger) ---------- */
+const sidebarEl = byId("sidebar");
+const mobileMenuBtn = byId("mobileMenuBtn");
+const mobileNavOverlay = byId("mobileNavOverlay");
+
+function openMobileNav() {
+  if (sidebarEl) sidebarEl.classList.add("open");
+  if (mobileNavOverlay) mobileNavOverlay.classList.add("show");
+  if (mobileMenuBtn) mobileMenuBtn.setAttribute("aria-expanded", "true");
+  document.body.classList.add("nav-open");
+}
+
+function closeMobileNav() {
+  if (sidebarEl) sidebarEl.classList.remove("open");
+  if (mobileNavOverlay) mobileNavOverlay.classList.remove("show");
+  if (mobileMenuBtn) mobileMenuBtn.setAttribute("aria-expanded", "false");
+  document.body.classList.remove("nav-open");
+}
+
+function toggleMobileNav() {
+  if (sidebarEl && sidebarEl.classList.contains("open")) {
+    closeMobileNav();
+  } else {
+    openMobileNav();
+  }
+}
+
+if (mobileMenuBtn) {
+  mobileMenuBtn.addEventListener("click", toggleMobileNav);
+}
+
+const sidebarCloseBtn = byId("sidebarCloseBtn");
+if (sidebarCloseBtn) {
+  sidebarCloseBtn.addEventListener("click", closeMobileNav);
+}
+
+if (mobileNavOverlay) {
+  mobileNavOverlay.addEventListener("click", closeMobileNav);
+}
+
+window.addEventListener("resize", () => {
+  if (window.innerWidth > 768) closeMobileNav();
+});
+
+/* ---------- Theme toggle ---------- */
+const THEME_KEY = "helmet-theme";
+const themeToggleBtn = byId("themeToggle");
+const themeSwitch = byId("themeSwitch");
+const themeLabel = themeToggleBtn ? themeToggleBtn.querySelector("span") : null;
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  const isDark = theme === "dark";
+
+  if (themeSwitch) themeSwitch.classList.toggle("on", isDark);
+  if (themeToggleBtn) themeToggleBtn.setAttribute("aria-pressed", String(isDark));
+
+  if (themeLabel) {
+    themeLabel.innerHTML = isDark
+      ? '<svg><use href="#icon-moon" /></svg> Dark mode'
+      : '<svg><use href="#icon-sun" /></svg> Light mode';
+  }
+}
+
+function getStoredTheme() {
+  try {
+    return localStorage.getItem(THEME_KEY);
+  } catch (err) {
+    return null;
+  }
+}
+
+function storeTheme(theme) {
+  try {
+    localStorage.setItem(THEME_KEY, theme);
+  } catch (err) {
+    /* storage unavailable, theme just won't persist */
+  }
+}
+
+const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+const initialTheme = getStoredTheme() || (prefersDark ? "dark" : "light");
+applyTheme(initialTheme);
+
+if (themeToggleBtn) {
+  themeToggleBtn.addEventListener("click", () => {
+    const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    applyTheme(next);
+    storeTheme(next);
+  });
+}
+
+/* ---------- Auth modal ---------- */
+const authModal = byId("authModal");
+const authForm = byId("authForm");
+const authTitle = byId("authTitle");
+const authSubtitle = byId("authSubtitle");
+const authSubmitBtn = byId("authSubmitBtn");
+const authSwitchText = byId("authSwitchText");
+const authSwitchBtn = byId("authSwitchBtn");
+const authNameField = byId("authNameField");
+const authCloseBtn = byId("authCloseBtn");
+
+let authMode = "login";
+
+function setAuthMode(mode) {
+  authMode = mode;
+  const isLogin = mode === "login";
+
+  authTitle.textContent = isLogin ? "Log In" : "Create Account";
+  authSubtitle.textContent = isLogin
+    ? "Access your helmet's safety dashboard."
+    : "Set up a new account to monitor your helmet.";
+  authSubmitBtn.textContent = isLogin ? "Log In" : "Register";
+  authSwitchText.textContent = isLogin ? "Don't have an account?" : "Already have an account?";
+  authSwitchBtn.textContent = isLogin ? "Register" : "Log In";
+  authNameField.style.display = isLogin ? "none" : "flex";
+}
+
+function openAuthModal(mode) {
+  setAuthMode(mode);
+  authModal.classList.add("show");
+  document.body.classList.add("modal-open");
+  closeMobileNav();
+}
+
+function closeAuthModal() {
+  if (!isAuthenticated) {
+    return;
+  }
+
+  authModal.classList.remove("show");
+  document.body.classList.remove("modal-open");
+}
+
+if (authCloseBtn) authCloseBtn.addEventListener("click", closeAuthModal);
+if (authSwitchBtn) {
+  authSwitchBtn.addEventListener("click", () => setAuthMode(authMode === "login" ? "register" : "login"));
+}
+if (authModal) {
+  authModal.addEventListener("click", (e) => {
+    if (e.target === authModal) closeAuthModal();
+  });
+}
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    closeAuthModal();
+    closeMobileNav();
+  }
+});
+
+function setAppLocked(locked) {
+  document.body.classList.toggle("auth-locked", locked);
+
+  if (locked) {
+    authModal.classList.add("show");
+    document.body.classList.add("modal-open");
+  } else {
+    authModal.classList.remove("show");
+    document.body.classList.remove("modal-open");
+  }
+}
+
+function showLoginRequired() {
+  isAuthenticated = false;
+  currentUser = null;
+  setLoggedOutUi();
+  setAppLocked(true);
+  openAuthModal("login");
+}
+
+function setLoggedInUi(user) {
+  currentUser = user || null;
+  const label = currentUser
+    ? (currentUser.name || currentUser.email || "Account")
+    : "Log In";
+
+  if (loginBtnTop) {
+    loginBtnTop.innerHTML = '<svg class="icon"><use href="#icon-user" /></svg> ' + label;
+  }
+
+  if (mobileLoginBtn) {
+    mobileLoginBtn.setAttribute("aria-label", currentUser ? ("Logged in as " + label) : "Log in");
+  }
+}
+
+function setLoggedOutUi() {
+  currentUser = null;
+
+  if (loginBtnTop) {
+    loginBtnTop.innerHTML = '<svg class="icon"><use href="#icon-user" /></svg> Log In';
+  }
+
+  if (mobileLoginBtn) {
+    mobileLoginBtn.setAttribute("aria-label", "Log in");
+  }
+}
+
+function readAuthError(data, fallback) {
+  return data && data.error ? data.error : fallback;
+}
+
+function apiFetch(url, options) {
+  const requestOptions = options || {};
+  requestOptions.credentials = "same-origin";
+
+  return fetch(url, requestOptions).then(response => {
+    if (response.status === 401) {
+      showLoginRequired();
+      throw new Error("LOGIN_REQUIRED");
+    }
+
+    if (!response.ok) {
+      return response.json()
+        .catch(() => null)
+        .then(data => {
+          throw new Error(readAuthError(data, "Request failed."));
+        });
+    }
+
+    return response;
+  });
+}
+
+function authRequest(path, payload) {
+  return fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }).then(response => {
+    if (!response.ok) {
+      return response.json()
+        .catch(() => null)
+        .then(data => {
+          throw new Error(readAuthError(data, "Authentication failed."));
+        });
+    }
+
+    return response.json();
+  });
+}
+
+async function checkSession() {
+  try {
+    const response = await fetch("/api/auth/me", {
+      method: "GET",
+      credentials: "same-origin",
+      cache: "no-store"
+    });
+
+    if (!response.ok) {
+      isAuthenticated = false;
+      setLoggedOutUi();
+      setAppLocked(true);
+      openAuthModal("login");
+      return;
+    }
+
+    const user = await response.json();
+    isAuthenticated = true;
+    setLoggedInUi(user);
+    setAppLocked(false);
+    loadStatus();
+    loadPinConfig();
+  } catch (err) {
+    isAuthenticated = false;
+    setLoggedOutUi();
+    setAppLocked(true);
+    openAuthModal("login");
+  }
+}
+
+function logout() {
+  fetch("/api/auth/logout", {
+    method: "POST",
+    credentials: "same-origin"
+  }).finally(() => {
+    isAuthenticated = false;
+    setLoggedOutUi();
+    showPage("dashboard");
+    setAppLocked(true);
+    openAuthModal("login");
+  });
+}
+
+if (authForm) {
+  authForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+
+    const name = byId("authName") ? byId("authName").value.trim() : "";
+    const email = byId("authEmail") ? byId("authEmail").value.trim() : "";
+    const password = byId("authPassword") ? byId("authPassword").value : "";
+
+    if (!email || !password) {
+      alert("Email and password are required.");
+      return;
+    }
+
+    authSubmitBtn.disabled = true;
+    authSubmitBtn.textContent = authMode === "login" ? "Logging in..." : "Creating...";
+
+    const loginPayload = { email, password };
+    const work = authMode === "register"
+      ? authRequest("/api/auth/register", { name, email, password }).then(() => authRequest("/api/auth/login", loginPayload))
+      : authRequest("/api/auth/login", loginPayload);
+
+    work
+      .then(() => {
+        return checkSession();
+      })
+      .catch(err => {
+        alert(err.message || "Authentication failed.");
+      })
+      .finally(() => {
+        authSubmitBtn.disabled = false;
+        setAuthMode(authMode);
+      });
+  });
+}
+
+function handleAccountButton() {
+  if (isAuthenticated) {
+    if (confirm("Log out of this helmet dashboard?")) {
+      logout();
+    }
+  } else {
+    openAuthModal("login");
+  }
+}
+
+const loginBtnTop = byId("loginBtnTop");
+if (loginBtnTop) loginBtnTop.addEventListener("click", handleAccountButton);
+
+const mobileLoginBtn = byId("mobileLoginBtn");
+if (mobileLoginBtn) mobileLoginBtn.addEventListener("click", handleAccountButton);
+
+/* ---------- Reading history log + shift notes ---------- */
+const MAX_LOG_ROWS = 500;
+const NOTES_KEY = "helmet-shift-notes";
+const sessionLog = [];
+
+const logTableBody = byId("logTableBody");
+const shiftNotes = byId("shiftNotes");
+
+function formatClock(date) {
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function logReading(data) {
+  if (!logTableBody) return;
+
+  const dhtConnected = data.dht_connected === true;
+  const temp = toNumber(data.temperature_c);
+  const hum = toNumber(data.humidity_percent);
+  const heatIndex = getHeatIndex(data, temp, hum);
+
+  const entry = {
+    time: new Date(),
+    gas: toNumber(data.gas_raw),
+    flame: toNumber(data.flame_raw),
+    temp,
+    hum,
+    heatIndex,
+    dist: toNumber(data.distance_cm),
+    buzzer: !!data.alarm_active
+  };
+
+  sessionLog.unshift(entry);
+  if (sessionLog.length > MAX_LOG_ROWS) sessionLog.length = MAX_LOG_ROWS;
+
+  renderLogTable();
+}
+
+function renderLogTable() {
+  if (!logTableBody) return;
+
+  if (sessionLog.length === 0) {
+    logTableBody.innerHTML = `<tr id="logEmptyRow"><td colspan="8" class="muted">No readings logged yet this session.</td></tr>`;
+    return;
+  }
+
+  logTableBody.innerHTML = sessionLog
+    .map(entry => `
+      <tr${entry.buzzer ? ' class="log-row-alarm"' : ""}>
+        <td>${formatClock(entry.time)}</td>
+        <td>${entry.gas}</td>
+        <td>${entry.flame}</td>
+        <td>${entry.temp.toFixed(1)}</td>
+        <td>${entry.hum.toFixed(1)}</td>
+        <td>${entry.heatIndex.toFixed(1)}</td>
+        <td>${entry.dist.toFixed(1)}</td>
+        <td>${entry.buzzer ? "ON" : "OFF"}</td>
+      </tr>
+    `)
+    .join("");
+}
+
+function exportLogCsv() {
+  if (sessionLog.length === 0) {
+    alert("No readings to export yet.");
+    return;
+  }
+
+  const header = "time,gas_raw,flame_raw,temperature_c,humidity_percent,heat_index_c,distance_cm,buzzer_alarm";
+  const rows = sessionLog
+    .slice()
+    .reverse()
+    .map(entry => [
+      entry.time.toISOString(),
+      entry.gas,
+      entry.flame,
+      entry.temp.toFixed(1),
+      entry.hum.toFixed(1),
+      entry.heatIndex.toFixed(1),
+      entry.dist.toFixed(1),
+      entry.buzzer ? "1" : "0"
+    ].join(","));
+
+  const csv = [header, ...rows].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `helmet-log-${Date.now()}.csv`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+function clearLog() {
+  if (sessionLog.length === 0) return;
+  if (!confirm("Clear all logged readings for this session?")) return;
+  sessionLog.length = 0;
+  renderLogTable();
+}
+
+const exportLogBtn = byId("exportLogBtn");
+const clearLogBtn = byId("clearLogBtn");
+if (exportLogBtn) exportLogBtn.addEventListener("click", exportLogCsv);
+if (clearLogBtn) clearLogBtn.addEventListener("click", clearLog);
+
+if (shiftNotes) {
+  try {
+    const savedNotes = localStorage.getItem(NOTES_KEY);
+    if (savedNotes) shiftNotes.value = savedNotes;
+  } catch (err) {
+    /* storage unavailable, notes just won't persist */
+  }
+
+  shiftNotes.addEventListener("input", () => {
+    try {
+      localStorage.setItem(NOTES_KEY, shiftNotes.value);
+    } catch (err) {
+      /* storage unavailable, notes just won't persist */
+    }
+  });
+}
+
+/* ---------- Dashboard ---------- */
+const GAUGE_CIRCUMFERENCE = 251.3;
+
+function setOutputState(id, active, activeText, inactiveText) {
+  const el = byId(id);
+  if (!el) return;
+
+  el.textContent = active ? activeText : inactiveText;
+  el.className = active ? "state warn" : "state safe";
+}
+
+function updateOutputIndicators(data) {
+  const outputs = data.outputs || {};
+
+  setOutputState("ledGasState", outputs.led_gas === true || data.gas_warning === true, "ON", "OFF");
+  setOutputState("ledFlameState", outputs.led_flame === true || data.flame_warning === true, "ON", "OFF");
+  setOutputState("ledHeatIndexState", outputs.led_heat_index === true || data.heat_index_warning === true, "ON", "OFF");
+  setOutputState("ledDistanceState", outputs.led_distance === true || data.distance_warning === true, "ON", "OFF");
+  setOutputState("buzzerState", outputs.buzzer === true || data.alarm_active === true, "SOUNDING", "OFF");
+}
+
+function updateDashboard(data) {
+  lastStatus = data;
+  logReading(data);
+
+  const gasConnected = data.gas_connected === true;
+  const flameConnected = data.flame_connected === true;
+  const dhtConnected = data.dht_connected === true;
+  const ultrasonicConnected = data.ultrasonic_connected === true;
+
+  const gas = toNumber(data.gas_raw);
+  const flame = toNumber(data.flame_raw);
+  const temp = toNumber(data.temperature_c);
+  const hum = toNumber(data.humidity_percent);
+  const heatIndex = getHeatIndex(data, temp, hum);
+  const dist = toNumber(data.distance_cm);
+
+  const heatIndexWarning = data.heat_index_warning === true ||
+    data.temperature_warning === true ||
+    data.humidity_warning === true;
+
+  setSensorDisplay("gasValue", "gasBar", "gasState", gasConnected, gas, "", 1023, data.gas_warning, "Gas level normal", "Gas warning detected", "Gas sensor not connected");
+  setSensorDisplay("flameValue", "flameBar", "flameState", flameConnected, flame, "", 1023, data.flame_warning, "No flame detected", "Flame warning detected", "Flame sensor not connected");
+  setSensorDisplay("tempValue", "tempBar", "tempState", dhtConnected, temp, "1", 60, false, "DHT temperature reading", "DHT warning", "DHT sensor not connected");
+  setSensorDisplay("humValue", "humBar", "humState", dhtConnected, hum, "1", 100, false, "DHT humidity reading", "DHT warning", "DHT sensor not connected");
+  setSensorDisplay("heatIndexValue", "heatIndexBar", "heatIndexState", dhtConnected, heatIndex, "1", 80, heatIndexWarning, "Computed heat index normal", "Computed heat index warning", "DHT sensor not connected");
+  setSensorDisplay("distValue", "distBar", "distState", ultrasonicConnected, dist, "1", 200, data.distance_warning, "Distance normal", "Obstacle too close", "Ultrasonic sensor not connected");
+
+  updateOutputIndicators(Object.assign({}, data, { heat_index_warning: heatIndexWarning }));
+
+  setText("wifiStatus", data.wifi_connected ? "Connected" : "Disconnected");
+  setText("alarmStatus", data.alarm_active ? "Buzzer ON" : "Buzzer OFF");
+  setText("updateCount", data.update_count);
+  setText("apiStatus", "Online");
+
+  setText("tableGas", formatMaybe(gas, 0, "raw", gasConnected));
+  setText("tableFlame", formatMaybe(flame, 0, "raw", flameConnected));
+  setText("tableTemp", formatMaybe(temp, 1, "Â°C", dhtConnected));
+  setText("tableHum", formatMaybe(hum, 1, "%", dhtConnected));
+  setText("tableHeatIndex", formatMaybe(heatIndex, 1, "Â°C", dhtConnected));
+  setText("tableDist", formatMaybe(dist, 1, "cm", ultrasonicConnected));
+  setText("tableGasConn", connectedText(gasConnected));
+  setText("tableFlameConn", connectedText(flameConnected));
+  setText("tableDhtConn", connectedText(dhtConnected));
+  setText("tableUltraConn", connectedText(ultrasonicConnected));
+  setText("tableGasWarn", yesNo(data.gas_warning));
+  setText("tableFlameWarn", yesNo(data.flame_warning));
+  setText("tableHeatIndexWarn", yesNo(heatIndexWarning));
+  setText("tableDistWarn", yesNo(data.distance_warning));
+  setText("tableAlarm", data.alarm_active ? "BUZZER SOUNDING" : "OFF");
+  setText("tableAlive", yesNo(data.system_alive));
+
+  const badge = byId("systemBadge");
+  const sideDot = byId("sideStatusDot");
+  const sideText = byId("sideStatusText");
+  const dangerPanel = byId("dangerPanel");
+  const dangerTitle = byId("dangerTitle");
+  const dangerText = byId("dangerText");
+  const gaugeFill = byId("gaugeFill");
+  const gaugeIcon = byId("gaugeIcon");
+
+  if (data.system_alive) {
+    badge.textContent = "System Online";
+    badge.className = "badge safe";
+    sideDot.className = "dot online";
+    sideText.textContent = "System online";
+  } else {
+    badge.textContent = "System Offline";
+    badge.className = "badge warning";
+    sideDot.className = "dot offline";
+    sideText.textContent = "System offline";
+  }
+
+  if (data.alarm_active) {
+    const activeWarnings = [];
+    if (data.gas_warning) activeWarnings.push("gas");
+    if (data.flame_warning) activeWarnings.push("flame");
+    if (heatIndexWarning) activeWarnings.push("heat index");
+    if (data.distance_warning) activeWarnings.push("distance");
+
+    dangerPanel.className = "hero-card danger";
+    dangerTitle.textContent = "Danger Detected";
+    dangerText.textContent = "Buzzer alarm is active because of: " + (activeWarnings.join(", ") || "unknown warning") + ".";
+    gaugeFill.setAttribute("stroke-dashoffset", "0");
+    gaugeFill.classList.add("danger");
+    gaugeIcon.classList.add("danger");
+    gaugeIcon.innerHTML = '<svg><use href="#icon-alert" /></svg>';
+  } else {
+    dangerPanel.className = "hero-card";
+    dangerTitle.textContent = "Helmet Safe";
+    dangerText.textContent = "Gas, flame, heat index, and distance readings are inside their safe range.";
+    gaugeFill.setAttribute("stroke-dashoffset", "0");
+    gaugeFill.classList.remove("danger");
+    gaugeIcon.classList.remove("danger");
+    gaugeIcon.innerHTML = '<svg><use href="#icon-shield-check" /></svg>';
+  }
+}
+
+function showApiLost() {
+  setText("apiStatus", "Offline");
+
+  const badge = byId("systemBadge");
+  const sideDot = byId("sideStatusDot");
+  const sideText = byId("sideStatusText");
+  const gaugeFill = byId("gaugeFill");
+  const gaugeIcon = byId("gaugeIcon");
+
+  badge.textContent = "Connection Lost";
+  badge.className = "badge warning";
+  sideDot.className = "dot offline";
+  sideText.textContent = "API offline";
+
+  setText("dangerTitle", "Connection Lost");
+  setText("dangerText", "The browser can't reach the ESP8266 at /api/status. Check that the helmet is powered and on the same network.");
+
+  if (gaugeFill) {
+    gaugeFill.setAttribute("stroke-dashoffset", String(GAUGE_CIRCUMFERENCE));
+    gaugeFill.classList.remove("danger");
+  }
+  if (gaugeIcon) {
+    gaugeIcon.classList.remove("danger");
+    gaugeIcon.innerHTML = '<svg><use href="#icon-wifi" /></svg>';
+  }
+}
+
+function loadStatus() {
+  if (!isAuthenticated) {
+    return;
+  }
+
+  apiFetch("/api/status", { cache: "no-store" })
+    .then(response => response.json())
+    .then(data => updateDashboard(data))
+    .catch(err => {
+      if (err.message !== "LOGIN_REQUIRED") {
+        showApiLost();
+      }
+    });
+}
+
+function renderWifiList(networks) {
+  const list = byId("wifiList");
+  list.innerHTML = "";
+
+  if (!networks || networks.length === 0) {
+    list.innerHTML = `<div class="notice"><svg class="icon"><use href="#icon-info" /></svg><span>No networks found.</span></div>`;
+    return;
+  }
+
+  networks.forEach(net => {
+    const item = document.createElement("div");
+    item.className = "wifi-item";
+
+    const ssid = net.ssid || "Hidden network";
+    const rssi = net.rssi || 0;
+    const auth = net.auth || "unknown";
+
+    item.innerHTML = `
+      <div class="wifi-item-name">
+        <svg class="icon"><use href="#icon-wifi" /></svg>
+        <div>
+          <strong>${ssid}</strong>
+          <span>RSSI: ${rssi} dBm ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· Security: ${auth}</span>
+        </div>
+      </div>
+      <button class="small-btn">Select</button>
+    `;
+
+    item.querySelector("button").addEventListener("click", () => {
+      byId("wifiSsid").value = ssid;
+    });
+
+    list.appendChild(item);
+  });
+}
+
+function scanWifi() {
+  const list = byId("wifiList");
+  list.innerHTML = `<div class="notice"><svg class="icon"><use href="#icon-info" /></svg><span>Scanning networks...</span></div>`;
+
+  apiFetch("/api/wifi/scan", { cache: "no-store" })
+    .then(response => {
+      return response.json();
+    })
+    .then(data => renderWifiList(data.networks || []))
+    .catch(err => {
+      if (err.message === "LOGIN_REQUIRED") {
+        list.innerHTML = `
+          <div class="notice">
+            <svg class="icon"><use href="#icon-info" /></svg>
+            <span>Log in first, then scan nearby Wi-Fi networks.</span>
+          </div>
+        `;
+        return;
+      }
+
+      list.innerHTML = `
+        <div class="notice">
+          <svg class="icon"><use href="#icon-info" /></svg>
+          <span>${err.message || "Wi-Fi scan endpoint isn't ready yet."}</span>
+        </div>
+      `;
+    });
+}
+
+function connectWifi(event) {
+  event.preventDefault();
+
+  const ssid = byId("wifiSsid").value.trim();
+  const password = byId("wifiPassword").value;
+
+  if (!ssid) {
+    alert("Enter a Wi-Fi SSID first.");
+    return;
+  }
+
+  apiFetch("/api/wifi/connect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ssid, password })
+  })
+    .then(response => {
+      alert("Wi-Fi connection request sent.");
+    })
+    .catch(err => {
+      if (err.message !== "LOGIN_REQUIRED") {
+        alert(err.message || "Firmware endpoint POST /api/wifi/connect isn't ready yet.");
+      }
+    });
+}
+
+function saveThresholds(event) {
+  event.preventDefault();
+
+  const config = {
+    gas_warning_level: Number(byId("gasLimit").value),
+    flame_warning_level: Number(byId("flameLimit").value),
+    heat_index_warning_level: Number(byId("heatIndexLimit").value),
+    distance_warning_cm: Number(byId("distLimit").value)
+  };
+
+  apiFetch("/api/config/thresholds", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config)
+  })
+    .then(() => {
+      alert("Thresholds saved.");
+    })
+    .catch(err => {
+      if (err.message !== "LOGIN_REQUIRED") {
+        alert(err.message || "Firmware endpoint POST /api/config/thresholds is not ready yet.");
+      }
+    });
+}
+
+/* ---------- Hardware pin configuration ---------- */
+const ADC_OPTIONS = ["A0", "ADC1", "ADC2", "ADC3", "ADC4", "ADC5", "ADC6", "ADC7"];
+const GPIO_OPTIONS = ["D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "GPIO3", "GPIO1"];
+
+const PIN_SELECT_IDS = [
+  "gas_adcPin",
+  "flame_adcPin",
+  "dht_dataPin",
+  "ultrasonic_trigPin",
+  "ultrasonic_echoPin",
+  "led_gasPin",
+  "led_flamePin",
+  "led_heat_indexPin",
+  "led_distancePin",
+  "buzzerPin"
+];
+
+function fillSelect(id, options) {
+  const select = byId(id);
+  if (!select || select.options.length > 0) return;
+
+  options.forEach(value => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    select.appendChild(option);
+  });
+}
+
+function initPinSelects() {
+  fillSelect("gas_adcPin", ADC_OPTIONS);
+  fillSelect("flame_adcPin", ADC_OPTIONS);
+
+  [
+    "dht_dataPin",
+    "ultrasonic_trigPin",
+    "ultrasonic_echoPin",
+    "led_gasPin",
+    "led_flamePin",
+    "led_heat_indexPin",
+    "led_distancePin",
+    "buzzerPin"
+  ].forEach(id => fillSelect(id, GPIO_OPTIONS));
+}
+
+function setPinValue(id, value) {
+  const select = byId(id);
+  if (!select || value === undefined || value === null) return;
+
+  const text = String(value);
+  const exists = Array.from(select.options).some(option => option.value === text);
+
+  if (!exists) {
+    const option = document.createElement("option");
+    option.value = text;
+    option.textContent = text;
+    select.appendChild(option);
+  }
+
+  select.value = text;
+}
+
+function loadPinConfig() {
+  initPinSelects();
+
+  if (!isAuthenticated || !byId("pinConfigForm")) {
+    return;
+  }
+
+  apiFetch("/api/config/pins", { cache: "no-store" })
+    .then(response => response.json())
+    .then(data => {
+      const pins = data.pins || data;
+
+      setPinValue("gas_adcPin", pins.gas_adc || pins.gas_adc_channel || "A0");
+      setPinValue("flame_adcPin", pins.flame_adc || pins.flame_adc_channel || "ADC1");
+      setPinValue("dht_dataPin", pins.dht_data || pins.dht_gpio || "D1");
+      setPinValue("ultrasonic_trigPin", pins.ultrasonic_trig || pins.ultrasonic_trig_gpio || "D2");
+      setPinValue("ultrasonic_echoPin", pins.ultrasonic_echo || pins.ultrasonic_echo_gpio || "D5");
+      setPinValue("led_gasPin", pins.led_gas || pins.led_gas_gpio || "D0");
+      setPinValue("led_flamePin", pins.led_flame || pins.led_flame_gpio || "D3");
+      setPinValue("led_heat_indexPin", pins.led_heat_index || pins.led_heat_index_gpio || "D4");
+      setPinValue("led_distancePin", pins.led_distance || pins.led_distance_gpio || "D6");
+      setPinValue("buzzerPin", pins.buzzer || pins.buzzer_gpio || "D7");
+    })
+    .catch(err => {
+      if (err.message !== "LOGIN_REQUIRED") {
+        /* Pin endpoint is optional for old firmware. Keep defaults visible. */
+      }
+    });
+}
+
+function savePinConfig(event) {
+  event.preventDefault();
+
+  const config = {
+    gas_adc: byId("gas_adcPin").value,
+    flame_adc: byId("flame_adcPin").value,
+    dht_data: byId("dht_dataPin").value,
+    ultrasonic_trig: byId("ultrasonic_trigPin").value,
+    ultrasonic_echo: byId("ultrasonic_echoPin").value,
+    led_gas: byId("led_gasPin").value,
+    led_flame: byId("led_flamePin").value,
+    led_heat_index: byId("led_heat_indexPin").value,
+    led_distance: byId("led_distancePin").value,
+    buzzer: byId("buzzerPin").value
+  };
+
+  apiFetch("/api/config/pins", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config)
+  })
+    .then(() => {
+      alert("Pin configuration saved.");
+    })
+    .catch(err => {
+      if (err.message !== "LOGIN_REQUIRED") {
+        alert(err.message || "Firmware endpoint POST /api/config/pins is not ready yet.");
+      }
+    });
+}
+
+
+function postAction(url, missingMessage) {
+  apiFetch(url, { method: "POST" })
+    .then(response => {
+      alert("Command sent.");
+    })
+    .catch(err => {
+      if (err.message !== "LOGIN_REQUIRED") {
+        alert(err.message || missingMessage);
+      }
+    });
+}
+
+byId("scanWifiBtn").addEventListener("click", scanWifi);
+byId("wifiForm").addEventListener("submit", connectWifi);
+byId("thresholdForm").addEventListener("submit", saveThresholds);
+
+const pinConfigForm = byId("pinConfigForm");
+if (pinConfigForm) pinConfigForm.addEventListener("submit", savePinConfig);
+initPinSelects();
+
+byId("testAlarmBtn").addEventListener("click", () => {
+  postAction("/api/alarm/test", "Firmware endpoint POST /api/alarm/test isn't ready yet.");
+});
+
+byId("restartBtn").addEventListener("click", () => {
+  if (confirm("Restart ESP8266 device?")) {
+    postAction("/api/system/restart", "Firmware endpoint POST /api/system/restart isn't ready yet.");
+  }
+});
+
+checkSession();
+setInterval(() => {
+  if (isAuthenticated) {
+    loadStatus();
+  }
+}, 1000);
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\spiffs\index.html =====
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Underground Helmet Control Panel</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body class="auth-locked">
+
+  <!-- Icon sprite: every icon in the UI is referenced from here via <use> -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="icon-helmet" viewBox="0 0 24 24">
+        <path d="M4 14c0-5.2 3.4-9.5 8-9.5s8 4.3 8 9.5" />
+        <path d="M3 14h18v2.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 16.5z" />
+        <path d="M12 4.5V2.5" />
+        <path d="M9 18v1a3 3 0 0 0 6 0v-1" />
+      </symbol>
+      <symbol id="icon-grid" viewBox="0 0 24 24">
+        <rect x="3" y="3" width="7.5" height="7.5" rx="1.2" />
+        <rect x="13.5" y="3" width="7.5" height="7.5" rx="1.2" />
+        <rect x="3" y="13.5" width="7.5" height="7.5" rx="1.2" />
+        <rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.2" />
+      </symbol>
+      <symbol id="icon-activity" viewBox="0 0 24 24">
+        <path d="M3 12h4l2.5-7 4.5 14 2.5-7H21" />
+      </symbol>
+      <symbol id="icon-wifi" viewBox="0 0 24 24">
+        <path d="M2.5 9a14.5 14.5 0 0 1 19 0" />
+        <path d="M6 13a9 9 0 0 1 12 0" />
+        <path d="M9.5 17a4 4 0 0 1 5 0" />
+        <circle cx="12" cy="20.2" r="1" fill="currentColor" stroke="none" />
+      </symbol>
+      <symbol id="icon-sliders" viewBox="0 0 24 24">
+        <line x1="4" y1="6" x2="20" y2="6" />
+        <line x1="4" y1="12" x2="20" y2="12" />
+        <line x1="4" y1="18" x2="20" y2="18" />
+        <circle cx="9" cy="6" r="2" />
+        <circle cx="16" cy="12" r="2" />
+        <circle cx="7" cy="18" r="2" />
+      </symbol>
+      <symbol id="icon-cpu" viewBox="0 0 24 24">
+        <rect x="6" y="6" width="12" height="12" rx="1.5" />
+        <rect x="9.5" y="9.5" width="5" height="5" />
+        <line x1="9" y1="2" x2="9" y2="6" />
+        <line x1="15" y1="2" x2="15" y2="6" />
+        <line x1="9" y1="18" x2="9" y2="22" />
+        <line x1="15" y1="18" x2="15" y2="22" />
+        <line x1="2" y1="9" x2="6" y2="9" />
+        <line x1="2" y1="15" x2="6" y2="15" />
+        <line x1="18" y1="9" x2="22" y2="9" />
+        <line x1="18" y1="15" x2="22" y2="15" />
+      </symbol>
+      <symbol id="icon-flask" viewBox="0 0 24 24">
+        <path d="M9 3h6" />
+        <path d="M10 3v6.2L4.8 18a2 2 0 0 0 1.7 3h11a2 2 0 0 0 1.7-3L14 9.2V3" />
+        <line x1="7.5" y1="15" x2="16.5" y2="15" />
+      </symbol>
+      <symbol id="icon-flame" viewBox="0 0 24 24">
+        <path d="M12 22a7 7 0 0 0 7-7c0-2.6-1.4-4.8-3.3-6.7-.9-.9-1.6-2-1.8-3.3-.1-.7-.8-1.1-1.4-.7-2.7 1.7-4.5 4.2-4.5 7.1 0 .6.1 1.2.3 1.8-.8-.5-1.4-1.2-1.8-2-.2-.5-.9-.5-1.2 0A7.2 7.2 0 0 0 5 15a7 7 0 0 0 7 7Z" />
+        <path d="M12 18a3 3 0 0 0 3-3c0-1.3-.7-2.3-1.6-3.2-.4-.4-.8-.9-1-1.5-.1-.4-.5-.5-.8-.2A5.4 5.4 0 0 0 9 14.5 3 3 0 0 0 12 18Z" />
+      </symbol>
+      <symbol id="icon-thermometer" viewBox="0 0 24 24">
+        <path d="M12 14.5V5a2 2 0 1 0-4 0v9.5a4 4 0 1 0 4 0Z" />
+      </symbol>
+      <symbol id="icon-droplet" viewBox="0 0 24 24">
+        <path d="M12 3s6.5 7.1 6.5 11.5a6.5 6.5 0 0 1-13 0C5.5 10.1 12 3 12 3Z" />
+      </symbol>
+      <symbol id="icon-radar" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" />
+        <circle cx="12" cy="12" r="5" />
+        <circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" />
+        <line x1="12" y1="3" x2="12" y2="1.5" />
+      </symbol>
+      <symbol id="icon-shield-check" viewBox="0 0 24 24">
+        <path d="M12 3 5 6v6c0 4.5 3 7.6 7 9 4-1.4 7-4.5 7-9V6Z" />
+        <path d="M9 12.2l2 2 4-4.4" />
+      </symbol>
+      <symbol id="icon-alert" viewBox="0 0 24 24">
+        <path d="M12 3 22 20H2Z" />
+        <line x1="12" y1="9.5" x2="12" y2="14" />
+        <circle cx="12" cy="17" r="0.9" fill="currentColor" stroke="none" />
+      </symbol>
+      <symbol id="icon-refresh" viewBox="0 0 24 24">
+        <path d="M4 12a8 8 0 0 1 14-5.3L20 9" />
+        <path d="M20 4v5h-5" />
+        <path d="M20 12a8 8 0 0 1-14 5.3L4 15" />
+        <path d="M4 20v-5h5" />
+      </symbol>
+      <symbol id="icon-sun" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="4.2" />
+        <line x1="12" y1="2.5" x2="12" y2="5" />
+        <line x1="12" y1="19" x2="12" y2="21.5" />
+        <line x1="4.2" y1="4.2" x2="6" y2="6" />
+        <line x1="18" y1="18" x2="19.8" y2="19.8" />
+        <line x1="2.5" y1="12" x2="5" y2="12" />
+        <line x1="19" y1="12" x2="21.5" y2="12" />
+        <line x1="4.2" y1="19.8" x2="6" y2="18" />
+        <line x1="18" y1="6" x2="19.8" y2="4.2" />
+      </symbol>
+      <symbol id="icon-moon" viewBox="0 0 24 24">
+        <path d="M20 14.5A8.5 8.5 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5Z" />
+      </symbol>
+      <symbol id="icon-info" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" />
+        <line x1="12" y1="11" x2="12" y2="16" />
+        <circle cx="12" cy="7.7" r="0.9" fill="currentColor" stroke="none" />
+      </symbol>
+      <symbol id="icon-menu" viewBox="0 0 24 24">
+        <line x1="4" y1="7" x2="20" y2="7" />
+        <line x1="4" y1="12" x2="20" y2="12" />
+        <line x1="4" y1="17" x2="20" y2="17" />
+      </symbol>
+      <symbol id="icon-close" viewBox="0 0 24 24">
+        <line x1="5" y1="5" x2="19" y2="19" />
+        <line x1="19" y1="5" x2="5" y2="19" />
+      </symbol>
+      <symbol id="icon-user" viewBox="0 0 24 24">
+        <circle cx="12" cy="8" r="3.5" />
+        <path d="M5 20c0-3.9 3.1-7 7-7s7 3.1 7 7" />
+      </symbol>
+      <symbol id="icon-user-plus" viewBox="0 0 24 24">
+        <circle cx="10" cy="8" r="3.5" />
+        <path d="M3.5 20c0-3.9 2.9-7 6.5-7s6.5 3.1 6.5 7" />
+        <line x1="18.5" y1="7" x2="18.5" y2="13" />
+        <line x1="15.5" y1="10" x2="21.5" y2="10" />
+      </symbol>
+      <symbol id="icon-download" viewBox="0 0 24 24">
+        <path d="M12 3v12" />
+        <path d="M7.5 10.5 12 15l4.5-4.5" />
+        <path d="M4 18.5h16" />
+      </symbol>
+      <symbol id="icon-note" viewBox="0 0 24 24">
+        <path d="M5 3.5h11l3 3V20a.5.5 0 0 1-.5.5H5a.5.5 0 0 1-.5-.5V4a.5.5 0 0 1 .5-.5Z" />
+        <line x1="8" y1="9" x2="16" y2="9" />
+        <line x1="8" y1="13" x2="16" y2="13" />
+        <line x1="8" y1="17" x2="13" y2="17" />
+      </symbol>
+    </defs>
+  </svg>
+
+  <div class="app-shell">
+    <!-- Mobile top bar: hamburger + brand mark, visible only on small screens -->
+    <header class="mobile-topbar">
+      <button id="mobileMenuBtn" class="icon-btn" type="button" aria-label="Open menu" aria-expanded="false">
+        <svg class="icon"><use href="#icon-menu" /></svg>
+      </button>
+      <div class="mobile-topbar-brand">
+        <svg class="icon"><use href="#icon-helmet" /></svg>
+        <span>Safety Monitor</span>
+      </div>
+      <button id="mobileLoginBtn" class="icon-btn" type="button" aria-label="Account">
+        <svg class="icon"><use href="#icon-user" /></svg>
+      </button>
+    </header>
+
+    <!-- Dimmed backdrop shown behind the sidebar when it's open on mobile -->
+    <div id="mobileNavOverlay" class="mobile-nav-overlay"></div>
+
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-head">
+        <div class="brand">
+          <div class="brand-icon"><svg class="icon"><use href="#icon-helmet" /></svg></div>
+          <div class="brand-text">
+            <h1>Helmet</h1>
+            <p>Safety Monitor</p>
+          </div>
+        </div>
+        <button id="sidebarCloseBtn" class="icon-btn sidebar-close" type="button" aria-label="Close menu">
+          <svg class="icon"><use href="#icon-close" /></svg>
+        </button>
+      </div>
+      <div class="hazard-stripe"></div>
+
+      <nav class="nav">
+        <p class="nav-label">Monitor</p>
+        <button class="nav-btn active" data-page="dashboard">
+          <svg class="icon"><use href="#icon-grid" /></svg> Dashboard
+        </button>
+        <button class="nav-btn" data-page="sensors">
+          <svg class="icon"><use href="#icon-activity" /></svg> Sensors
+        </button>
+        <button class="nav-btn" data-page="logs">
+          <svg class="icon"><use href="#icon-note" /></svg> Logs &amp; Notes
+        </button>
+        <p class="nav-label" style="margin-top:14px;">Configure</p>
+        <button class="nav-btn" data-page="wifi">
+          <svg class="icon"><use href="#icon-wifi" /></svg> Wi-Fi Setup
+        </button>
+        <button class="nav-btn" data-page="thresholds">
+          <svg class="icon"><use href="#icon-sliders" /></svg> Thresholds
+        </button>
+        <button class="nav-btn" data-page="device">
+          <svg class="icon"><use href="#icon-cpu" /></svg> Device
+        </button>
+      </nav>
+
+      <button id="themeToggle" class="theme-toggle" type="button" aria-pressed="false">
+        <span><svg><use href="#icon-sun" /></svg> Light mode</span>
+        <span class="switch" id="themeSwitch"></span>
+      </button>
+
+      <div class="sidebar-status">
+        <span id="sideStatusDot" class="dot"></span>
+        <span id="sideStatusText">Connecting...</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Embedded Safety System</p>
+          <h2 id="pageTitle">Dashboard</h2>
+        </div>
+
+        <div class="top-actions">
+          <span id="systemBadge" class="badge neutral">Connecting...</span>
+          <button id="loginBtnTop" class="small-btn auth-btn-top">
+            <svg class="icon"><use href="#icon-user" /></svg> Log In
+          </button>
+        </div>
+      </header>
+
+      <section id="dashboard" class="page active">
+        <section id="dangerPanel" class="hero-card">
+          <div class="hazard-stripe"></div>
+          <div class="hero-card-body">
+            <div class="hero-text">
+              <p class="eyebrow">Safety State</p>
+              <h3 id="dangerTitle">Waiting for data</h3>
+              <p id="dangerText">The dashboard is waiting for the first reading from the helmet.</p>
+            </div>
+            <div class="gauge">
+              <svg viewBox="0 0 96 96">
+                <circle class="gauge-track" cx="48" cy="48" r="40" />
+                <circle id="gaugeFill" class="gauge-fill" cx="48" cy="48" r="40"
+                        stroke-dasharray="251.3" stroke-dashoffset="251.3" />
+              </svg>
+              <div id="gaugeIcon" class="gauge-icon">
+                <svg><use href="#icon-shield-check" /></svg>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="summary-grid">
+          <article class="summary-card">
+            <span>Wi-Fi</span>
+            <strong id="wifiStatus">--</strong>
+          </article>
+
+          <article class="summary-card">
+            <span>Alarm</span>
+            <strong id="alarmStatus">--</strong>
+          </article>
+
+          <article class="summary-card">
+            <span>Updates</span>
+            <strong id="updateCount">--</strong>
+          </article>
+
+          <article class="summary-card">
+            <span>API</span>
+            <strong id="apiStatus">--</strong>
+          </article>
+        </section>
+
+        <section class="sensor-grid">
+          <article class="sensor-card">
+            <div class="sensor-head">
+              <span class="sensor-icon"><svg class="icon"><use href="#icon-flask" /></svg></span>
+              <div>
+                <h3>Gas Level</h3>
+                <p>MQ sensor raw reading</p>
+              </div>
+            </div>
+            <div class="reading"><span id="gasValue">--</span><small>raw</small></div>
+            <div class="meter"><div id="gasBar" class="meter-fill offline"></div></div>
+            <div id="gasState" class="state offline">Gas sensor not connected</div>
+          </article>
+
+          <article class="sensor-card">
+            <div class="sensor-head">
+              <span class="sensor-icon danger-icon"><svg class="icon"><use href="#icon-flame" /></svg></span>
+              <div>
+                <h3>Flame Sensor</h3>
+                <p>Flame module raw reading</p>
+              </div>
+            </div>
+            <div class="reading"><span id="flameValue">--</span><small>raw</small></div>
+            <div class="meter"><div id="flameBar" class="meter-fill offline"></div></div>
+            <div id="flameState" class="state offline">Flame sensor not connected</div>
+          </article>
+
+          <article class="sensor-card wide-sensor-card dht-computed-card">
+            <div class="sensor-head">
+              <span class="sensor-icon"><svg class="icon"><use href="#icon-thermometer" /></svg></span>
+              <div>
+                <h3>DHT Temperature &amp; Humidity</h3>
+                <p>One DHT sensor gives temperature and humidity. Heat index is computed from both values.</p>
+              </div>
+            </div>
+
+            <div class="dht-reading-grid">
+              <div class="dht-reading">
+                <span class="dht-label">Temperature</span>
+                <strong><span id="tempValue">--</span><small>Â°C</small></strong>
+              </div>
+
+              <div class="dht-reading">
+                <span class="dht-label">Humidity</span>
+                <strong><span id="humValue">--</span><small>%</small></strong>
+              </div>
+
+              <div class="dht-reading computed">
+                <span class="dht-label">Computed Heat Index</span>
+                <strong><span id="heatIndexValue">--</span><small>Â°C</small></strong>
+              </div>
+            </div>
+
+            <div class="meter"><div id="heatIndexBar" class="meter-fill offline"></div></div>
+            <div id="heatIndexState" class="state offline">DHT sensor not connected</div>
+          </article>
+
+          <article class="sensor-card wide-sensor-card">
+            <div class="sensor-head">
+              <span class="sensor-icon"><svg class="icon"><use href="#icon-radar" /></svg></span>
+              <div>
+                <h3>Distance</h3>
+                <p>Nearest obstacle ahead</p>
+              </div>
+            </div>
+            <div class="reading"><span id="distValue">--</span><small>cm</small></div>
+            <div class="meter"><div id="distBar" class="meter-fill offline"></div></div>
+            <div id="distState" class="state offline">Ultrasonic sensor not connected</div>
+          </article>
+        </section>
+      </section>
+
+      <section id="sensors" class="page">
+        <div class="panel">
+          <h3>Live Sensor Details</h3>
+          <p class="muted">Full raw status as reported by the ESP8266, updated every second.</p>
+
+          <div class="table-wrap">
+            <table>
+              <tbody>
+                <tr><td>Gas Raw</td><td id="tableGas">--</td></tr>
+                <tr><td>Flame Raw</td><td id="tableFlame">--</td></tr>
+                <tr><td>Temperature</td><td id="tableTemp">--</td></tr>
+                <tr><td>Humidity</td><td id="tableHum">--</td></tr>
+                <tr><td>Computed Heat Index</td><td id="tableHeatIndex">--</td></tr>
+                <tr><td>Distance</td><td id="tableDist">--</td></tr>
+                <tr><td>Gas Connected</td><td id="tableGasConn">--</td></tr>
+                <tr><td>Flame Connected</td><td id="tableFlameConn">--</td></tr>
+                <tr><td>DHT Connected</td><td id="tableDhtConn">--</td></tr>
+                <tr><td>Ultrasonic Connected</td><td id="tableUltraConn">--</td></tr>
+                <tr><td>Gas Warning</td><td id="tableGasWarn">--</td></tr>
+                <tr><td>Flame Warning</td><td id="tableFlameWarn">--</td></tr>
+                <tr><td>Computed Heat Index Warning</td><td id="tableHeatIndexWarn">--</td></tr>
+                <tr><td>Distance Warning</td><td id="tableDistWarn">--</td></tr>
+                <tr><td>Buzzer Alarm Active</td><td id="tableAlarm">--</td></tr>
+                <tr><td>System Alive</td><td id="tableAlive">--</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="logs" class="page">
+        <div class="panel">
+          <div class="section-head">
+            <div>
+              <h3>Reading History</h3>
+              <p class="muted">Every reading received in this browser session, newest first. Export it any time as CSV.</p>
+            </div>
+            <div class="logs-actions">
+              <button id="exportLogBtn" class="small-btn">
+                <svg class="icon"><use href="#icon-download" /></svg> Export CSV
+              </button>
+              <button id="clearLogBtn" class="small-btn">Clear</button>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table id="logTable">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Gas</th>
+                  <th>Flame</th>
+                  <th>Temp Â°C</th>
+                  <th>Humidity %</th>
+                  <th>Heat Index Â°C</th>
+                  <th>Distance cm</th>
+                  <th>Buzzer</th>
+                </tr>
+              </thead>
+              <tbody id="logTableBody">
+                <tr id="logEmptyRow"><td colspan="8" class="muted">No readings logged yet this session.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Shift Notes</h3>
+          <p class="muted">Jot down anything worth remembering about this session Ã¢â‚¬â€ saved only in this browser tab.</p>
+          <textarea id="shiftNotes" class="notes-area" placeholder="e.g. Checked helmet seal before descent, gas baseline reads a bit high near the east shaft..."></textarea>
+        </div>
+      </section>
+
+      <section id="wifi" class="page">
+        <div class="panel">
+          <div class="section-head">
+            <div>
+              <h3>Wi-Fi Setup</h3>
+              <p class="muted">Scan nearby networks and connect the helmet to one of them.</p>
+            </div>
+            <button id="scanWifiBtn" class="primary-btn">Scan Networks</button>
+          </div>
+
+          <div id="wifiApiNotice" class="notice">
+            <svg class="icon"><use href="#icon-info" /></svg>
+            <span>Network scanning needs a firmware endpoint: <strong>GET /api/wifi/scan</strong>.
+            The current firmware only exposes <strong>/api/status</strong>.</span>
+          </div>
+
+          <div id="wifiList" class="wifi-list"></div>
+
+          <form id="wifiForm" class="form-grid">
+            <label>
+              SSID
+              <input id="wifiSsid" type="text" placeholder="Network name" />
+            </label>
+
+            <label>
+              Password
+              <input id="wifiPassword" type="password" placeholder="Wi-Fi password" />
+            </label>
+
+            <button type="submit" class="primary-btn">Connect</button>
+          </form>
+        </div>
+
+        <div class="panel">
+          <h3>Known Network Strategy</h3>
+          <p class="muted">
+            How the firmware should choose a network: scan, compare against saved credentials,
+            then connect to the strongest match.
+          </p>
+
+          <div class="logic-box">
+            <p>1. Browser requests a Wi-Fi scan.</p>
+            <p>2. ESP8266 runs <code>esp_wifi_scan_start()</code>.</p>
+            <p>3. Firmware compares scanned SSIDs against saved credentials.</p>
+            <p>4. The strongest matching network is selected by RSSI.</p>
+            <p>5. Firmware calls <code>esp_wifi_set_config()</code> then <code>esp_wifi_connect()</code>.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="thresholds" class="page">
+        <div class="panel">
+          <h3>Danger Thresholds</h3>
+          <p class="muted">
+            These limits decide when a sensor reading counts as a warning. They should be saved
+            to NVS or SPIFFS so they survive a restart, not hardcoded in app_config.h.
+          </p>
+
+          <form id="thresholdForm" class="form-grid two">
+            <label>
+              Gas Warning Level
+              <input id="gasLimit" type="number" min="0" max="1023" value="600" />
+            </label>
+
+            <label>
+              Flame Warning Level
+              <input id="flameLimit" type="number" min="0" max="1023" value="500" />
+            </label>
+
+            <label>
+              Computed Heat Index Warning Â°C
+              <input id="heatIndexLimit" type="number" min="0" max="100" value="40" />
+            </label>
+
+            <label>
+              Distance Warning cm
+              <input id="distLimit" type="number" min="0" max="500" value="30" />
+            </label>
+
+            <button type="submit" class="primary-btn">Save Thresholds</button>
+          </form>
+
+          <div class="notice">
+            <svg class="icon"><use href="#icon-info" /></svg>
+            <span>This UI sends gas, flame, computed heat index, and distance limits to <strong>POST /api/config/thresholds</strong>.</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="device" class="page">
+        <div class="panel">
+          <h3>Device Information</h3>
+
+          <div class="info-grid">
+            <div><span>Project</span><strong>Underground Helmet</strong></div>
+            <div><span>Firmware</span><strong>1.0.0</strong></div>
+            <div><span>Mode</span><strong>ESP8266 RTOS SDK</strong></div>
+            <div><span>Filesystem</span><strong>SPIFFS</strong></div>
+            <div><span>Web API</span><strong>/api/status</strong></div>
+            <div><span>Update Rate</span><strong>1 second</strong></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Live Outputs</h3>
+          <p class="muted">Alarm is the buzzer sound. There is no separate alarm LED in this UI.</p>
+
+          <div class="output-grid">
+            <div><span>Gas LED</span><strong id="ledGasState" class="state offline">--</strong></div>
+            <div><span>Flame LED</span><strong id="ledFlameState" class="state offline">--</strong></div>
+            <div><span>Computed Heat Index LED</span><strong id="ledHeatIndexState" class="state offline">--</strong></div>
+            <div><span>Distance LED</span><strong id="ledDistanceState" class="state offline">--</strong></div>
+            <div><span>Buzzer Alarm</span><strong id="buzzerState" class="state offline">--</strong></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Hardware Pins</h3>
+          <p class="muted">Configure sensors, warning LEDs, and the buzzer. Save, then restart if your firmware requires restart to apply pins.</p>
+
+          <form id="pinConfigForm" class="form-grid two">
+            <label>
+              Gas Analog
+              <select id="gas_adcPin"></select>
+            </label>
+
+            <label>
+              Flame Analog
+              <select id="flame_adcPin"></select>
+            </label>
+
+            <label>
+              DHT Data
+              <select id="dht_dataPin"></select>
+            </label>
+
+            <label>
+              Ultrasonic TRIG
+              <select id="ultrasonic_trigPin"></select>
+            </label>
+
+            <label>
+              Ultrasonic ECHO
+              <select id="ultrasonic_echoPin"></select>
+            </label>
+
+            <label>
+              Gas LED
+              <select id="led_gasPin"></select>
+            </label>
+
+            <label>
+              Flame LED
+              <select id="led_flamePin"></select>
+            </label>
+
+            <label>
+              Heat Index LED
+              <select id="led_heat_indexPin"></select>
+            </label>
+
+            <label>
+              Distance LED
+              <select id="led_distancePin"></select>
+            </label>
+
+            <label>
+              Buzzer
+              <select id="buzzerPin"></select>
+            </label>
+
+            <button type="submit" class="primary-btn">Save Pin Configuration</button>
+          </form>
+
+          <div class="notice">
+            <svg class="icon"><use href="#icon-info" /></svg>
+            <span>ESP8266 has only one internal analog input, A0. If gas and flame are both analog, use an external ADC or multiplexer.</span>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>System Actions</h3>
+          <p class="muted">Use these to test the buzzer alarm and restart the ESP8266.</p>
+
+          <div class="action-row">
+            <button id="testAlarmBtn" class="secondary-btn">Test Alarm</button>
+            <button id="restartBtn" class="danger-btn">Restart Device</button>
+          </div>
+
+          <div class="notice">
+            <svg class="icon"><use href="#icon-info" /></svg>
+            <span>These actions call <strong>POST /api/alarm/test</strong> and <strong>POST /api/system/restart</strong>.</span>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Login / Register modal: dashboard stays locked until session is valid -->
+  <div id="authModal" class="modal-overlay">
+    <div class="modal-card">
+      <button id="authCloseBtn" class="icon-btn modal-close" type="button" aria-label="Close">
+        <svg class="icon"><use href="#icon-close" /></svg>
+      </button>
+
+      <div class="modal-brand">
+        <div class="brand-icon"><svg class="icon"><use href="#icon-helmet" /></svg></div>
+      </div>
+
+      <h3 id="authTitle">Log In</h3>
+      <p id="authSubtitle" class="muted">Access your helmet's safety dashboard.</p>
+
+      <form id="authForm" class="form-grid one">
+        <label id="authNameField" style="display:none;">
+          Full Name
+          <input id="authName" type="text" placeholder="Jane Doe" autocomplete="name" />
+        </label>
+
+        <label>
+          Email
+          <input id="authEmail" type="email" placeholder="you@example.com" autocomplete="email" required />
+        </label>
+
+        <label>
+          Password
+          <input id="authPassword" type="password" placeholder="Password" autocomplete="current-password" required />
+        </label>
+
+        <button id="authSubmitBtn" type="submit" class="primary-btn full">Log In</button>
+      </form>
+
+      <p class="modal-switch">
+        <span id="authSwitchText">Don't have an account?</span>
+        <button id="authSwitchBtn" type="button" class="link-btn">Register</button>
+      </p>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\spiffs\style.css =====
+/* style.css Ã¢â‚¬â€ Underground Helmet Safety Monitor
+   Design system: concrete/graphite surfaces, safety-amber accent,
+   hazard-stripe signature, condensed industrial type. */
+
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  /* ---- Light theme (default) ---- */
+  --bg: #eef0ed;
+  --bg-secondary: #e2e6e1;
+  --surface: #ffffff;
+  --surface-2: #f6f8f5;
+  --border: #d6dbd3;
+  --border-strong: #b9c0b6;
+
+  --text-primary: #14181a;
+  --text-secondary: #4c5550;
+  --text-muted: #828c86;
+  --text-inverse: #0d1110;
+  --on-accent: #14181a;
+
+  --accent: #d97f06;
+  --accent-strong: #b56600;
+  --accent-soft: #fbe8cc;
+
+  --danger: #c92a1d;
+  --danger-soft: #fbe6e2;
+  --safe: #1f8a4c;
+  --safe-soft: #e1f3e7;
+  --warning: var(--accent);
+  --warning-soft: var(--accent-soft);
+
+  --stripe-a: var(--accent);
+  --stripe-b: #14181a;
+
+  --font-display: 'Space Grotesk', 'IBM Plex Sans', sans-serif;
+  --font-body: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'SF Mono', monospace;
+
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 1px 2px rgba(15, 20, 18, 0.06);
+  --shadow: 0 2px 8px rgba(15, 20, 18, 0.08);
+  --shadow-md: 0 8px 20px rgba(15, 20, 18, 0.10);
+
+  --transition: all 0.16s cubic-bezier(0.4, 0, 0.2, 1);
+
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --bg: #0c0f0e;
+  --bg-secondary: #15191a;
+  --surface: #181e1e;
+  --surface-2: #1f2625;
+  --border: #2b3433;
+  --border-strong: #3a4544;
+
+  --text-primary: #f0f2ee;
+  --text-secondary: #a7afaa;
+  --text-muted: #677169;
+  --text-inverse: #f0f2ee;
+  --on-accent: #14181a;
+
+  --accent: #ffb020;
+  --accent-strong: #ffc658;
+  --accent-soft: rgba(255, 176, 32, 0.14);
+
+  --danger: #ff5b4d;
+  --danger-soft: rgba(255, 91, 77, 0.14);
+  --safe: #3ddc8a;
+  --safe-soft: rgba(61, 220, 138, 0.14);
+  --warning: var(--accent);
+  --warning-soft: var(--accent-soft);
+
+  --stripe-a: var(--accent);
+  --stripe-b: #0c0f0e;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 10px 24px rgba(0, 0, 0, 0.45);
+
+  color-scheme: dark;
+}
+
+html {
+  background: var(--bg);
+}
+
+body {
+  font-family: var(--font-body);
+  background: var(--bg);
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+body.modal-open,
+body.nav-open {
+  overflow: hidden;
+}
+
+svg.icon {
+  width: 20px;
+  height: 20px;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+
+/* Hazard-stripe signature: used in exactly two places, never as decoration */
+.hazard-stripe {
+  height: 5px;
+  width: 100%;
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--stripe-a) 0 8px,
+    var(--stripe-b) 8px 16px
+  );
+  border-radius: 100px;
+}
+
+/* Generic icon-only button (mobile topbar, modal close, sidebar close) */
+.icon-btn {
+  width: 38px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+
+.icon-btn:hover {
+  background: var(--bg-secondary);
+}
+
+/* ---------- Layout ---------- */
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 252px 1fr;
+}
+
+/* ---------- Mobile top bar ---------- */
+.mobile-topbar {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  grid-column: 1 / -1;
+}
+
+.mobile-topbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 14.5px;
+  color: var(--text-primary);
+}
+
+.mobile-topbar-brand svg {
+  width: 18px;
+  height: 18px;
+  color: var(--accent-strong);
+}
+
+[data-theme="dark"] .mobile-topbar-brand svg {
+  color: var(--accent);
+}
+
+.mobile-nav-overlay {
+  display: none;
+}
+
+/* ---------- Sidebar ---------- */
+.sidebar {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+}
+
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sidebar-close {
+  display: none;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 16px;
+}
+
+.brand-icon {
+  width: 42px;
+  height: 42px;
+  background: var(--text-primary);
+  color: var(--bg);
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.brand-icon svg {
+  width: 24px;
+  height: 24px;
+  stroke: var(--accent);
+  stroke-width: 1.9;
+}
+
+.brand-text h1 {
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+.brand-text p {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+/* Navigation */
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.nav-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 0 12px 8px;
+}
+
+.nav-btn {
+  width: 100%;
+  padding: 10px 12px;
+  text-align: left;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 13.5px;
+  font-weight: 500;
+  transition: var(--transition);
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  position: relative;
+}
+
+.nav-btn svg {
+  width: 18px;
+  height: 18px;
+  stroke-width: 1.75;
+}
+
+.nav-btn:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.nav-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+[data-theme="dark"] .nav-btn.active {
+  color: var(--accent);
+}
+
+.nav-btn.active::before {
+  content: '';
+  position: absolute;
+  left: -20px;
+  width: 3px;
+  height: 22px;
+  background: var(--accent);
+  border-radius: 0 2px 2px 0;
+}
+
+/* Theme toggle */
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+}
+
+.theme-toggle span {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.theme-toggle svg {
+  width: 16px;
+  height: 16px;
+}
+
+.switch {
+  width: 38px;
+  height: 22px;
+  border-radius: 100px;
+  background: var(--border-strong);
+  border: none;
+  cursor: pointer;
+  position: relative;
+  transition: var(--transition);
+  flex-shrink: 0;
+}
+
+.switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--surface);
+  transition: var(--transition);
+  box-shadow: var(--shadow-sm);
+}
+
+.switch.on {
+  background: var(--accent);
+}
+
+.switch.on::after {
+  transform: translateX(16px);
+}
+
+/* Sidebar Status */
+.sidebar-status {
+  padding: 12px 14px;
+  background: var(--bg-secondary);
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  font-weight: 500;
+  font-family: var(--font-mono);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  box-shadow: 0 0 0 3px var(--bg);
+  flex-shrink: 0;
+}
+
+.dot.online {
+  background: var(--safe);
+  box-shadow: 0 0 0 3px var(--safe-soft);
+}
+
+.dot.offline {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
+/* ---------- Main Content ---------- */
+.main {
+  padding: 28px 36px 48px;
+  max-width: 1320px;
+  min-width: 0;
+}
+
+/* Top Bar */
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 28px;
+  gap: 16px;
+}
+
+.eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--accent-strong);
+  margin-bottom: 6px;
+  font-family: var(--font-mono);
+}
+
+[data-theme="dark"] .eyebrow {
+  color: var(--accent);
+}
+
+.topbar h2 {
+  font-family: var(--font-display);
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.auth-btn-top {
+  display: inline-flex;
+}
+
+.badge {
+  padding: 7px 14px;
+  border-radius: 100px;
+  font-size: 12.5px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+}
+
+.badge::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.badge.neutral {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  border-color: var(--border);
+}
+
+.badge.safe {
+  background: var(--safe-soft);
+  color: var(--safe);
+}
+
+.badge.warning {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* Buttons */
+button {
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  transition: var(--transition);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.small-btn {
+  padding: 8px 14px;
+  background: var(--surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.small-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.small-btn:hover {
+  background: var(--bg-secondary);
+  border-color: var(--text-muted);
+}
+
+.primary-btn {
+  padding: 11px 18px;
+  background: var(--text-primary);
+  color: var(--bg);
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+.primary-btn.full {
+  width: 100%;
+  margin-top: 4px;
+}
+
+[data-theme="dark"] .primary-btn {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.primary-btn:hover {
+  background: var(--accent-strong);
+  color: #fff;
+}
+
+[data-theme="dark"] .primary-btn:hover {
+  background: var(--accent-strong);
+  color: var(--on-accent);
+}
+
+.secondary-btn {
+  padding: 11px 18px;
+  background: var(--surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.secondary-btn:hover {
+  background: var(--bg-secondary);
+}
+
+.danger-btn {
+  padding: 11px 18px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.danger-btn:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent-strong);
+  font-weight: 600;
+  font-size: 13px;
+  text-decoration: underline;
+  padding: 0;
+}
+
+[data-theme="dark"] .link-btn {
+  color: var(--accent);
+}
+
+/* Pages */
+.page {
+  display: none;
+  animation: fadeIn 0.2s ease;
+}
+
+.page.active {
+  display: block;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ---------- Dashboard hero: status gauge ---------- */
+.hero-card {
+  padding: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+}
+
+.hero-card-body {
+  padding: 28px 32px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+}
+
+.hero-card.danger .hero-card-body {
+  background: var(--danger-soft);
+}
+
+.hero-text h3 {
+  font-family: var(--font-display);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+.hero-text p {
+  color: var(--text-secondary);
+  font-size: 14px;
+  max-width: 46ch;
+}
+
+.gauge {
+  position: relative;
+  width: 96px;
+  height: 96px;
+  flex-shrink: 0;
+}
+
+.gauge svg {
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+
+.gauge-track {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 8;
+}
+
+.gauge-fill {
+  fill: none;
+  stroke: var(--safe);
+  stroke-width: 8;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.4s ease, stroke 0.3s ease;
+}
+
+.gauge-fill.danger {
+  stroke: var(--danger);
+}
+
+.gauge-icon {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--safe);
+}
+
+.gauge-icon svg {
+  width: 32px;
+  height: 32px;
+  transform: none;
+  stroke-width: 2;
+}
+
+.gauge-icon.danger {
+  color: var(--danger);
+}
+
+/* Summary Grid */
+.summary-grid {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+}
+
+.summary-card {
+  padding: 18px 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.summary-card span {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+}
+
+.summary-card strong {
+  font-family: var(--font-mono);
+  font-size: 21px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* Sensor Grid */
+.sensor-grid {
+  margin-top: 24px;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 14px;
+}
+
+.sensor-card {
+  padding: 22px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  transition: var(--transition);
+}
+
+.sensor-card:hover {
+  box-shadow: var(--shadow-md);
+  border-color: var(--border-strong);
+}
+
+.sensor-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 20px;
+}
+
+.sensor-icon {
+  width: 42px;
+  height: 42px;
+  background: var(--bg-secondary);
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-strong);
+  flex-shrink: 0;
+}
+
+[data-theme="dark"] .sensor-icon {
+  color: var(--accent);
+}
+
+.sensor-icon svg {
+  width: 21px;
+  height: 21px;
+}
+
+.sensor-card h3 {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 3px;
+}
+
+.sensor-card p {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.reading {
+  margin-bottom: 18px;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.reading span {
+  font-size: 32px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  letter-spacing: -0.01em;
+}
+
+.reading small {
+  font-size: 13px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.meter {
+  height: 5px;
+  background: var(--bg-secondary);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+
+.meter-fill {
+  height: 100%;
+  background: var(--safe);
+  transition: width 0.3s ease, background 0.3s ease;
+  border-radius: 3px;
+}
+
+.meter-fill.warning {
+  background: var(--danger);
+}
+
+.state {
+  padding: 6px 13px;
+  border-radius: 100px;
+  font-size: 12.5px;
+  font-weight: 600;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  display: inline-block;
+  font-family: var(--font-mono);
+}
+
+.state.safe {
+  background: var(--safe-soft);
+  color: var(--safe);
+}
+
+.state.warn {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* Panels */
+.panel {
+  padding: 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  margin-bottom: 20px;
+  box-shadow: var(--shadow-sm);
+}
+
+.panel h3 {
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 7px;
+}
+
+.muted {
+  color: var(--text-muted);
+  font-size: 13.5px;
+}
+
+/* Section Head */
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 18px;
+  gap: 16px;
+}
+
+.logs-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* Table */
+.table-wrap {
+  overflow-x: auto;
+  margin-top: 14px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+thead th {
+  padding: 10px 16px;
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+#logTable thead th:last-child {
+  text-align: right;
+}
+
+td {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13.5px;
+  white-space: nowrap;
+}
+
+td:first-child {
+  color: var(--text-muted);
+  font-weight: 500;
+  width: 40%;
+}
+
+td:last-child {
+  text-align: right;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+
+#logTable td {
+  font-family: var(--font-mono);
+}
+
+#logTable td:first-child {
+  width: auto;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+tr.log-row-alarm td {
+  color: var(--danger);
+}
+
+/* Notes area */
+.notes-area {
+  margin-top: 14px;
+  width: 100%;
+  min-height: 140px;
+  resize: vertical;
+  padding: 14px 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+
+.notes-area:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Forms */
+.form-grid {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 14px;
+  align-items: end;
+}
+
+.form-grid.two {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.form-grid.one {
+  grid-template-columns: 1fr;
+}
+
+.form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.form-grid input {
+  padding: 11px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  color: var(--text-primary);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  transition: var(--transition);
+}
+
+.form-grid input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* WiFi List */
+.wifi-list {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wifi-item {
+  padding: 14px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.wifi-item-name {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.wifi-item-name svg {
+  width: 18px;
+  height: 18px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.wifi-item strong {
+  font-size: 13.5px;
+  display: block;
+  margin-bottom: 3px;
+}
+
+.wifi-item span {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+/* Notice */
+.notice {
+  margin-top: 14px;
+  padding: 14px 16px;
+  background: var(--warning-soft);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  color: var(--accent-strong);
+  font-size: 12.5px;
+  line-height: 1.6;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+[data-theme="dark"] .notice {
+  color: var(--accent);
+}
+
+.notice svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.notice strong {
+  color: inherit;
+}
+
+/* Info Grid */
+.info-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.info-grid div {
+  padding: 16px 18px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.info-grid span {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  display: block;
+  margin-bottom: 7px;
+}
+
+.info-grid strong {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+
+/* Logic Box */
+.logic-box {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.logic-box p {
+  padding: 14px 16px;
+  background: var(--bg-secondary);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  color: var(--text-secondary);
+}
+
+code {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12.5px;
+  font-family: var(--font-mono);
+}
+
+[data-theme="dark"] code {
+  color: var(--accent);
+}
+
+/* Action Row */
+.action-row {
+  display: flex;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+
+/* ---------- Auth gate ---------- */
+body.auth-locked {
+  overflow: hidden;
+}
+
+body.auth-locked .app-shell {
+  display: none;
+}
+
+body.auth-locked #authModal {
+  display: flex;
+}
+
+body.auth-locked .modal-close {
+  display: none;
+}
+
+.state.offline {
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+
+.meter-fill.offline {
+  width: 0%;
+  background: var(--border-strong);
+}
+
+/* ---------- Auth modal ---------- */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 13, 12, 0.55);
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 100;
+}
+
+.modal-overlay.show {
+  display: flex;
+}
+
+.modal-card {
+  position: relative;
+  width: 100%;
+  max-width: 380px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 32px 28px 28px;
+  box-shadow: var(--shadow-md);
+}
+
+.modal-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+}
+
+.modal-brand {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 16px;
+}
+
+.modal-brand .brand-icon {
+  width: 48px;
+  height: 48px;
+}
+
+.modal-brand .brand-icon svg {
+  width: 26px;
+  height: 26px;
+}
+
+.modal-card h3 {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 700;
+  text-align: center;
+  margin-bottom: 6px;
+}
+
+.modal-card .muted {
+  text-align: center;
+  margin-bottom: 18px;
+}
+
+.modal-switch {
+  text-align: center;
+  margin-top: 16px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+/* ---------- Responsive ---------- */
+
+/* Tablet: keep the sidebar, tighten layout and drop to 2-up grids */
+@media (max-width: 1024px) {
+  .app-shell {
+    grid-template-columns: 208px 1fr;
+  }
+
+  .sidebar {
+    padding: 16px;
+  }
+
+  .main {
+    padding: 24px;
+  }
+
+  .sensor-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Mobile: sidebar becomes a slide-in drawer behind a hamburger menu */
+@media (max-width: 768px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .mobile-topbar {
+    display: flex;
+  }
+
+  .auth-btn-top {
+    display: none;
+  }
+
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 100vh;
+    width: 78vw;
+    max-width: 300px;
+    z-index: 40;
+    border-right: 1px solid var(--border);
+    transform: translateX(-100%);
+    transition: transform 0.22s ease;
+    box-shadow: var(--shadow-md);
+  }
+
+  .sidebar.open {
+    transform: translateX(0);
+  }
+
+  .sidebar-close {
+    display: flex;
+  }
+
+  .mobile-nav-overlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(10, 13, 12, 0.5);
+    z-index: 35;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.2s ease;
+  }
+
+  .mobile-nav-overlay.show {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  .brand {
+    padding-bottom: 0;
+  }
+
+  .brand-text h1 {
+    font-size: 15px;
+  }
+
+  .hazard-stripe {
+    height: 3px;
+  }
+
+  .main {
+    padding: 18px;
+  }
+
+  .topbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  .topbar h2 {
+    font-size: 23px;
+  }
+
+  .top-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .hero-card-body {
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 22px 20px;
+    gap: 18px;
+  }
+
+  .gauge {
+    width: 72px;
+    height: 72px;
+    align-self: center;
+  }
+
+  .summary-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .info-grid,
+  .form-grid,
+  .form-grid.two {
+    grid-template-columns: 1fr;
+  }
+
+  .form-grid button {
+    width: 100%;
+  }
+
+  .section-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .section-head .primary-btn {
+    width: 100%;
+  }
+
+  .logs-actions {
+    flex-direction: column;
+  }
+
+  .logs-actions .small-btn {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .action-row {
+    flex-direction: column;
+  }
+
+  .wifi-item {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .wifi-item button {
+    width: 100%;
+  }
+
+  .modal-card {
+    padding: 28px 22px 22px;
+  }
+}
+
+/* Small phones: compress type and padding further */
+@media (max-width: 420px) {
+  .main {
+    padding: 14px;
+  }
+
+  .topbar h2 {
+    font-size: 20px;
+  }
+
+  .panel,
+  .hero-card-body {
+    padding: 18px 16px;
+  }
+
+  .summary-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .summary-card {
+    padding: 14px 16px;
+  }
+
+  .summary-card strong {
+    font-size: 18px;
+  }
+
+  .sensor-card {
+    padding: 18px;
+  }
+
+  .reading span {
+    font-size: 28px;
+  }
+
+  td {
+    padding: 11px 12px;
+    font-size: 12.5px;
+  }
+
+  th {
+    padding: 8px 12px;
+  }
+
+  .badge {
+    font-size: 11.5px;
+    padding: 6px 11px;
+  }
+
+  .mobile-topbar-brand span {
+    font-size: 13px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Flame + output additions */
+.sensor-icon.danger-icon {
+  color: var(--danger);
+}
+
+.wide-sensor-card {
+  min-height: 100%;
+}
+
+.output-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.output-grid div {
+  padding: 16px 18px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.output-grid span {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  display: block;
+  margin-bottom: 8px;
+}
+
+.form-grid select {
+  padding: 11px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  color: var(--text-primary);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  transition: var(--transition);
+}
+
+.form-grid select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* DHT sensor: temperature + humidity with computed heat index */
+.dht-computed-card {
+  grid-column: span 2;
+}
+
+.dht-reading-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.dht-reading {
+  padding: 14px 15px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.dht-reading .dht-label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.dht-reading strong {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 24px;
+  color: var(--text-primary);
+}
+
+.dht-reading strong span {
+  font-size: 24px;
+}
+
+.dht-reading small {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.dht-reading.computed {
+  border-color: var(--border-strong);
+}
+
+@media (max-width: 768px) {
+  .dht-computed-card {
+    grid-column: span 1;
+  }
+
+  .dht-reading-grid {
+    grid-template-columns: 1fr;
+  }
+}
+

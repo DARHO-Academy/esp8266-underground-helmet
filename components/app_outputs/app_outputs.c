@@ -1,5 +1,4 @@
 #include "app_outputs.h"
-#include "app_config.h"
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -28,16 +27,25 @@ void app_outputs_init(void)
 {
     ESP_LOGI(TAG, "Initializing output pins");
 
-    app_outputs_configure_pin(APP_LED_SYSTEM_GPIO);
-    app_outputs_configure_pin(APP_LED_WIFI_GPIO);
-    app_outputs_configure_pin(APP_LED_GAS_GPIO);
-    app_outputs_configure_pin(APP_LED_DHT_GPIO);
-    app_outputs_configure_pin(APP_LED_DISTANCE_GPIO);
-    app_outputs_configure_pin(APP_BUZZER_GPIO);
+    const app_system_pin_config_t *pins = app_system_get_pins();
+
+    app_outputs_configure_pin(pins->led_gas_gpio);
+    app_outputs_configure_pin(pins->led_flame_gpio);
+    app_outputs_configure_pin(pins->led_heat_index_gpio);
+    app_outputs_configure_pin(pins->led_distance_gpio);
+    app_outputs_configure_pin(pins->buzzer_gpio);
 
     app_outputs_set_all_off();
 
-    ESP_LOGI(TAG, "Output pins initialized");
+    ESP_LOGI(
+        TAG,
+        "Outputs initialized: led_gas=%d led_flame=%d led_heat_index=%d led_distance=%d buzzer=%d",
+        pins->led_gas_gpio,
+        pins->led_flame_gpio,
+        pins->led_heat_index_gpio,
+        pins->led_distance_gpio,
+        pins->buzzer_gpio
+    );
 }
 
 void app_outputs_update(const app_system_state_t *state)
@@ -46,26 +54,33 @@ void app_outputs_update(const app_system_state_t *state)
         return;
     }
 
-    app_outputs_write(APP_LED_SYSTEM_GPIO, state->system_alive);
-    app_outputs_write(APP_LED_WIFI_GPIO, state->wifi_connected);
-    app_outputs_write(APP_LED_GAS_GPIO, state->gas_warning);
-    app_outputs_write(APP_LED_DHT_GPIO, state->temperature_warning || state->humidity_warning);
-    app_outputs_write(APP_LED_DISTANCE_GPIO, state->distance_warning);
+    const app_system_pin_config_t *pins = app_system_get_pins();
 
+    app_outputs_write(pins->led_gas_gpio, state->gas_warning);
+    app_outputs_write(pins->led_flame_gpio, state->flame_warning);
+    app_outputs_write(pins->led_heat_index_gpio, state->heat_index_warning);
+    app_outputs_write(pins->led_distance_gpio, state->distance_warning);
+
+    /*
+     * Alarm is buzzer sound.
+     * There is no alarm LED.
+     */
     app_outputs_set_buzzer(state->alarm_active);
 }
 
 void app_outputs_set_all_off(void)
 {
-    app_outputs_write(APP_LED_SYSTEM_GPIO, false);
-    app_outputs_write(APP_LED_WIFI_GPIO, false);
-    app_outputs_write(APP_LED_GAS_GPIO, false);
-    app_outputs_write(APP_LED_DHT_GPIO, false);
-    app_outputs_write(APP_LED_DISTANCE_GPIO, false);
-    app_outputs_write(APP_BUZZER_GPIO, false);
+    const app_system_pin_config_t *pins = app_system_get_pins();
+
+    app_outputs_write(pins->led_gas_gpio, false);
+    app_outputs_write(pins->led_flame_gpio, false);
+    app_outputs_write(pins->led_heat_index_gpio, false);
+    app_outputs_write(pins->led_distance_gpio, false);
+    app_outputs_write(pins->buzzer_gpio, false);
 }
 
 void app_outputs_set_buzzer(bool on)
 {
-    app_outputs_write(APP_BUZZER_GPIO, on);
+    const app_system_pin_config_t *pins = app_system_get_pins();
+    app_outputs_write(pins->buzzer_gpio, on);
 }
