@@ -1,5 +1,6 @@
 C:/darho/esp8266-rtos/academy/projects/underground-helmet/build/app_auth/libapp_auth.a
  C:/darho/esp8266-rtos/academy/projects/underground-helmet/build/app_config/libapp_config.a
+ C:/darho/esp8266-rtos/academy/projects/underground-helmet/build/app_logs/libapp_logs.a
  C:/darho/esp8266-rtos/academy/projects/underground-helmet/build/app_ota/libapp_ota.a
  C:/darho/esp8266-rtos/academy/projects/underground-helmet/build/app_outputs/libapp_outputs.a
  C:/darho/esp8266-rtos/academy/projects/underground-helmet/build/app_sensors/libapp_sensors.a

@@ -1,13 +1,6 @@
-app_webserver.o: \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_webserver/app_webserver.c \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_webserver/include/app_webserver.h \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_system/include/app_system.h \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_config/include/app_config.h \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_wifi/include/app_wifi.h \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_auth/include/app_auth.h \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_outputs/include/app_outputs.h \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_sensors/include/app_sensors.h \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_ota/include/app_ota.h \
+app_logs.o: \
+ C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_logs/app_logs.c \
+ C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_logs/include/app_logs.h \
  C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/esp_common/include/esp_err.h \
  C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/esp_http_server/include/esp_http_server.h \
  C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/freertos/include/freertos/FreeRTOS.h \
@@ -41,29 +34,12 @@ app_webserver.o: \
  C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/freertos/include/freertos/task.h \
  C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/freertos/include/freertos/private/list.h \
  C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/http_parser/include/http_parser.h \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_logs/include/app_logs.h \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_webserver/include/json_min.h \
+ C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_system/include/app_system.h \
+ C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_config/include/app_config.h \
  C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/log/include/esp_log.h \
- C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/log/include/esp_log_internal.h \
- C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/spiffs/include/esp_spiffs.h \
- C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/esp8266/include/esp_system.h \
- C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/esp8266/include/esp_idf_version.h
+ C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/log/include/esp_log_internal.h
 
-C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_webserver/include/app_webserver.h:
-
-C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_system/include/app_system.h:
-
-C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_config/include/app_config.h:
-
-C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_wifi/include/app_wifi.h:
-
-C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_auth/include/app_auth.h:
-
-C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_outputs/include/app_outputs.h:
-
-C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_sensors/include/app_sensors.h:
-
-C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_ota/include/app_ota.h:
+C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_logs/include/app_logs.h:
 
 C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/esp_common/include/esp_err.h:
 
@@ -131,17 +107,11 @@ C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/freertos/include/freertos/priv
 
 C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/http_parser/include/http_parser.h:
 
-C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_logs/include/app_logs.h:
+C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_system/include/app_system.h:
 
-C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_webserver/include/json_min.h:
+C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_config/include/app_config.h:
 
 C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/log/include/esp_log.h:
 
 C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/log/include/esp_log_internal.h:
-
-C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/spiffs/include/esp_spiffs.h:
-
-C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/esp8266/include/esp_system.h:
-
-C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/esp8266/include/esp_idf_version.h:
-/c/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_webserver/./app_webserver.c:
+/c/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_logs/./app_logs.c:

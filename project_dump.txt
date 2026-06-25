@@ -8,10 +8,15 @@ include $(IDF_PATH)/make/project.mk
 
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\partitions.csv =====
 # Name,   Type, SubType, Offset,   Size,     Flags
-nvs,      data, nvs,     0x9000,   0x6000,
+# OTA layout for 4 MB ESP8266 modules such as ESP-12E/NodeMCU.
+# First USB flash is required after changing this table.
+nvs,      data, nvs,     0x9000,   0x4000,
+otadata,  data, ota,     0xd000,   0x2000,
 phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x100000,
-storage,  data, spiffs,  0x110000, 0x80000,
+ota_0,    app,  ota_0,   0x10000,  0x100000,
+ota_1,    app,  ota_1,   0x110000, 0x100000,
+storage,  data, spiffs,  0x210000, 0x80000,
+
 
 
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\README.md =====
@@ -52,12 +57,15 @@ main
 static const char *TAG = "APP_AUTH";
 
 #define USERS_FILE_PATH     "/spiffs/users.dat"
+#define ADMIN_EMAIL         "admin"
+#define ADMIN_PASSWORD      "12345678"
+#define ADMIN_NAME          "Administrator"
 #define SALT_LEN_BYTES      8
 #define SALT_HEX_LEN        (SALT_LEN_BYTES * 2)
 #define HASH_LEN_BYTES      32
 #define HASH_HEX_LEN        (HASH_LEN_BYTES * 2)
-#define USER_LINE_MAX        160
-#define SESSION_TTL_SECONDS  (12 * 60 * 60) /* 12 hours */
+#define USER_LINE_MAX       160
+#define SESSION_TTL_SECONDS (12 * 60 * 60) /* 12 hours */
 
 typedef struct {
     bool in_use;
@@ -77,6 +85,7 @@ static void bytes_to_hex(const uint8_t *bytes, size_t len, char *out_hex)
         out_hex[i * 2]     = digits[(bytes[i] >> 4) & 0x0F];
         out_hex[i * 2 + 1] = digits[bytes[i] & 0x0F];
     }
+
     out_hex[len * 2] = '\0';
 }
 
@@ -108,11 +117,6 @@ static void hash_password(const char *password, const char *salt_hex, char *out_
     bytes_to_hex(digest, sizeof(digest), out_hash_hex);
 }
 
-/*
- * Each stored line looks like:
- *   email|salt_hex|hash_hex|full_name\n
- * Fields cannot contain '|' or newline; inputs are validated for this.
- */
 static bool field_is_clean(const char *value)
 {
     if (value == NULL) {
@@ -126,6 +130,16 @@ static bool field_is_clean(const char *value)
     }
 
     return true;
+}
+
+static bool is_admin_email_value(const char *email)
+{
+    return email != NULL && strcmp(email, ADMIN_EMAIL) == 0;
+}
+
+bool app_auth_is_admin_email(const char *email)
+{
+    return is_admin_email_value(email);
 }
 
 static bool find_user_line(const char *email, char *out_line, size_t out_line_size)
@@ -172,6 +186,7 @@ void app_auth_init(void)
     fclose(file);
 
     ESP_LOGI(TAG, "Auth store ready at %s", USERS_FILE_PATH);
+    ESP_LOGI(TAG, "Permanent admin login enabled: %s", ADMIN_EMAIL);
 }
 
 app_auth_result_t app_auth_register(
@@ -186,6 +201,10 @@ app_auth_result_t app_auth_register(
 
     if (strlen(email) == 0 || strlen(password) == 0) {
         return APP_AUTH_ERR_INVALID_INPUT;
+    }
+
+    if (is_admin_email_value(email)) {
+        return APP_AUTH_ERR_EXISTS;
     }
 
     if (strlen(email) >= APP_AUTH_USERNAME_MAX || strlen(full_name) >= APP_AUTH_NAME_MAX) {
@@ -223,7 +242,6 @@ static app_auth_session_t *find_free_session_slot(void)
 {
     int64_t now = (int64_t)time(NULL);
 
-    /* Prefer a genuinely empty slot, otherwise reuse the oldest expired one. */
     for (int i = 0; i < APP_AUTH_MAX_SESSIONS; i++) {
         if (!sessions[i].in_use) {
             return &sessions[i];
@@ -239,6 +257,34 @@ static app_auth_session_t *find_free_session_slot(void)
     return NULL;
 }
 
+static app_auth_result_t create_session(const char *email, const char *name, char *out_token)
+{
+    app_auth_session_t *slot = find_free_session_slot();
+
+    if (slot == NULL) {
+        return APP_AUTH_ERR_FULL;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+
+    generate_random_hex(slot->token, APP_AUTH_TOKEN_LEN / 2);
+    strncpy(slot->email, email, sizeof(slot->email) - 1);
+    slot->email[sizeof(slot->email) - 1] = '\0';
+
+    if (name != NULL) {
+        strncpy(slot->full_name, name, sizeof(slot->full_name) - 1);
+        slot->full_name[sizeof(slot->full_name) - 1] = '\0';
+    }
+
+    slot->expires_at = (int64_t)time(NULL) + SESSION_TTL_SECONDS;
+    slot->in_use = true;
+
+    strncpy(out_token, slot->token, APP_AUTH_TOKEN_LEN);
+    out_token[APP_AUTH_TOKEN_LEN] = '\0';
+
+    return APP_AUTH_OK;
+}
+
 app_auth_result_t app_auth_login(
     const char *email,
     const char *password,
@@ -249,17 +295,30 @@ app_auth_result_t app_auth_login(
         return APP_AUTH_ERR_INVALID_INPUT;
     }
 
+    if (is_admin_email_value(email)) {
+        if (strcmp(password, ADMIN_PASSWORD) != 0) {
+            return APP_AUTH_ERR_BAD_PASSWORD;
+        }
+
+        app_auth_result_t result = create_session(ADMIN_EMAIL, ADMIN_NAME, out_token);
+
+        if (result == APP_AUTH_OK) {
+            ESP_LOGI(TAG, "Admin login OK");
+        }
+
+        return result;
+    }
+
     char line[USER_LINE_MAX];
 
     if (!find_user_line(email, line, sizeof(line))) {
         return APP_AUTH_ERR_NOT_FOUND;
     }
 
-    /* line format: email|salt_hex|hash_hex|full_name\n */
     char *saved_email = strtok(line, "|");
-    char *saved_salt   = strtok(NULL, "|");
-    char *saved_hash   = strtok(NULL, "|");
-    char *saved_name   = strtok(NULL, "\r\n");
+    char *saved_salt  = strtok(NULL, "|");
+    char *saved_hash  = strtok(NULL, "|");
+    char *saved_name  = strtok(NULL, "\r\n");
 
     if (saved_email == NULL || saved_salt == NULL || saved_hash == NULL) {
         ESP_LOGE(TAG, "Corrupt user record for %s", email);
@@ -273,32 +332,13 @@ app_auth_result_t app_auth_login(
         return APP_AUTH_ERR_BAD_PASSWORD;
     }
 
-    app_auth_session_t *slot = find_free_session_slot();
+    app_auth_result_t result = create_session(email, saved_name != NULL ? saved_name : "", out_token);
 
-    if (slot == NULL) {
-        return APP_AUTH_ERR_FULL;
+    if (result == APP_AUTH_OK) {
+        ESP_LOGI(TAG, "Login OK for %s", email);
     }
 
-    generate_random_hex(slot->token, APP_AUTH_TOKEN_LEN / 2);
-    strncpy(slot->email, email, sizeof(slot->email) - 1);
-    slot->email[sizeof(slot->email) - 1] = '\0';
-
-    if (saved_name != NULL) {
-        strncpy(slot->full_name, saved_name, sizeof(slot->full_name) - 1);
-        slot->full_name[sizeof(slot->full_name) - 1] = '\0';
-    } else {
-        slot->full_name[0] = '\0';
-    }
-
-    slot->expires_at = (int64_t)time(NULL) + SESSION_TTL_SECONDS;
-    slot->in_use = true;
-
-    strncpy(out_token, slot->token, APP_AUTH_TOKEN_LEN);
-    out_token[APP_AUTH_TOKEN_LEN] = '\0';
-
-    ESP_LOGI(TAG, "Login OK for %s", email);
-
-    return APP_AUTH_OK;
+    return result;
 }
 
 void app_auth_logout(const char *token)
@@ -380,6 +420,17 @@ bool app_auth_session_get_user(
     return false;
 }
 
+bool app_auth_session_is_admin(const char *token)
+{
+    char email[APP_AUTH_USERNAME_MAX];
+
+    if (!app_auth_session_is_valid(token, email, sizeof(email))) {
+        return false;
+    }
+
+    return is_admin_email_value(email);
+}
+
 bool app_auth_extract_token_from_cookie(const char *cookie_header, char *out_token, size_t out_token_size)
 {
     if (cookie_header == NULL || out_token == NULL || out_token_size == 0) {
@@ -405,6 +456,96 @@ bool app_auth_extract_token_from_cookie(const char *cookie_header, char *out_tok
     out_token[i] = '\0';
 
     return i > 0;
+}
+
+static void json_escape_small(const char *input, char *output, size_t output_size)
+{
+    if (output == NULL || output_size == 0) {
+        return;
+    }
+
+    output[0] = '\0';
+
+    if (input == NULL) {
+        return;
+    }
+
+    size_t out = 0;
+
+    for (size_t i = 0; input[i] != '\0' && out < output_size - 1; i++) {
+        char ch = input[i];
+
+        if (ch == '"' || ch == '\\') {
+            if (out + 2 >= output_size) {
+                break;
+            }
+
+            output[out++] = '\\';
+            output[out++] = ch;
+        } else if ((unsigned char)ch < 0x20) {
+            continue;
+        } else {
+            output[out++] = ch;
+        }
+    }
+
+    output[out] = '\0';
+}
+
+void app_auth_users_json(char *out_json, size_t out_json_size)
+{
+    if (out_json == NULL || out_json_size == 0) {
+        return;
+    }
+
+    size_t offset = 0;
+
+    offset += snprintf(
+        out_json + offset,
+        out_json_size - offset,
+        "{\"ok\":true,\"users\":[{\"email\":\"%s\",\"name\":\"%s\",\"role\":\"admin\"}",
+        ADMIN_EMAIL,
+        ADMIN_NAME
+    );
+
+    FILE *file = fopen(USERS_FILE_PATH, "r");
+
+    if (file != NULL) {
+        char line[USER_LINE_MAX];
+
+        while (fgets(line, sizeof(line), file) != NULL && offset < out_json_size - 80) {
+            char line_copy[USER_LINE_MAX];
+            strncpy(line_copy, line, sizeof(line_copy) - 1);
+            line_copy[sizeof(line_copy) - 1] = '\0';
+
+            char *email = strtok(line_copy, "|");
+            (void)strtok(NULL, "|");
+            (void)strtok(NULL, "|");
+            char *name = strtok(NULL, "\r\n");
+
+            if (email == NULL || is_admin_email_value(email)) {
+                continue;
+            }
+
+            char safe_email[APP_AUTH_USERNAME_MAX * 2];
+            char safe_name[APP_AUTH_NAME_MAX * 2];
+
+            json_escape_small(email, safe_email, sizeof(safe_email));
+            json_escape_small(name != NULL ? name : "", safe_name, sizeof(safe_name));
+
+            offset += snprintf(
+                out_json + offset,
+                out_json_size - offset,
+                ",{\"email\":\"%s\",\"name\":\"%s\",\"role\":\"user\"}",
+                safe_email,
+                safe_name
+            );
+        }
+
+        fclose(file);
+    }
+
+    snprintf(out_json + offset, out_json_size - offset, "]}");
 }
 
 
@@ -601,42 +742,22 @@ typedef enum {
     APP_AUTH_ERR_FULL
 } app_auth_result_t;
 
-/*
- * Mounts and prepares the user store.
- * Must be called once at boot, after SPIFFS is mounted.
- */
 void app_auth_init(void);
 
-/*
- * Registers a new user.
- * email is used as the unique login identifier (case-sensitive as given).
- * Returns APP_AUTH_ERR_EXISTS if the email is already registered.
- */
 app_auth_result_t app_auth_register(
     const char *full_name,
     const char *email,
     const char *password
 );
 
-/*
- * Validates email/password and, on success, creates a new session and
- * writes its token (as a null-terminated hex string) into out_token.
- * out_token must be at least APP_AUTH_TOKEN_LEN + 1 bytes.
- */
 app_auth_result_t app_auth_login(
     const char *email,
     const char *password,
     char *out_token
 );
 
-/*
- * Removes a session (logout). No-op if the token is unknown.
- */
 void app_auth_logout(const char *token);
 
-/*
- * Returns true and fills out_email if the token maps to a live session.
- */
 bool app_auth_session_is_valid(const char *token, char *out_email, size_t out_email_size);
 
 bool app_auth_session_get_user(
@@ -647,10 +768,12 @@ bool app_auth_session_get_user(
     size_t out_name_size
 );
 
-/*
- * Extracts the "session" cookie value from a raw Cookie header value.
- * Returns true if found, writing into out_token (size out_token_size).
- */
+bool app_auth_session_is_admin(const char *token);
+
+bool app_auth_is_admin_email(const char *email);
+
+void app_auth_users_json(char *out_json, size_t out_json_size);
+
 bool app_auth_extract_token_from_cookie(const char *cookie_header, char *out_token, size_t out_token_size);
 
 #endif
@@ -713,22 +836,18 @@ COMPONENT_ADD_INCLUDEDIRS := include
 
 /*
  * Sensor input mode:
- * 0 = do not show fake readings; dashboard will show sensors as not connected
- *     until real sensor drivers are added.
+ * 0 = read real sensors.
  * 1 = use fixed demo readings for UI/testing without hardware.
  */
 #define APP_SENSOR_USE_TEST_VALUES  0
 
 /*
- * ESP8266 has only one real analog input: A0.
- * APP_GAS_ADC_CHANNEL 0 means internal A0.
- * APP_FLAME_ADC_CHANNEL 1 means external ADC channel 1.
- *
- * If you do not use external ADC/multiplexer, gas and flame cannot both be
- * analog at the same time on ESP8266.
+ * ESP8266 has one real analog input: A0.
+ * In this wiring, flame sensor uses analog A0.
+ * MQ135 gas sensor uses digital DO on a GPIO.
  */
-#define APP_GAS_ADC_CHANNEL         0
-#define APP_FLAME_ADC_CHANNEL       1
+#define APP_FLAME_ADC_CHANNEL       0
+#define APP_GAS_DIGITAL_GPIO        12
 
 /*
  * Default digital sensor pins.
@@ -744,20 +863,19 @@ COMPONENT_ADD_INCLUDEDIRS := include
  * 3. Heat Index LED
  * 4. Distance LED
  *
- * Alarm is NOT a LED.
  * Alarm is the buzzer sound.
  */
 #define APP_LED_GAS_GPIO            16
 #define APP_LED_FLAME_GPIO          0
 #define APP_LED_HEAT_INDEX_GPIO     2
-#define APP_LED_DISTANCE_GPIO       12
+#define APP_LED_DISTANCE_GPIO       15
 
 #define APP_BUZZER_GPIO             13
 
 /*
  * Danger thresholds.
- * Temperature and humidity are not separate LEDs anymore.
- * They create one heat index value and one heat index warning LED.
+ * Gas is digital, so firmware maps gas danger to 1023 and normal to 0.
+ * Flame remains analog on A0.
  */
 #define APP_GAS_WARNING_LEVEL           600
 #define APP_FLAME_WARNING_LEVEL         500
@@ -765,12 +883,20 @@ COMPONENT_ADD_INCLUDEDIRS := include
 #define APP_DISTANCE_WARNING_CM         30
 
 /*
- * Flame sensor logic:
+ * Digital MQ module logic:
+ * 1 = gas warning when DO reads LOW
+ * 0 = gas warning when DO reads HIGH
+ *
+ * Most MQ135 LM393 modules output LOW when the adjusted gas threshold is crossed.
+ */
+#define APP_GAS_DIGITAL_ACTIVE_LOW      1
+
+/*
+ * Flame analog logic:
  * 0 = flame warning when analog value is LOWER than threshold
  * 1 = flame warning when analog value is HIGHER than threshold
  *
  * Many flame modules give lower analog value when flame is near.
- * Test your module and change this if needed.
  */
 #define APP_FLAME_HIGHER_IS_DANGER      0
 
@@ -780,7 +906,805 @@ COMPONENT_ADD_INCLUDEDIRS := include
 #define APP_SENSOR_READ_DELAY_MS    2000
 #define APP_WEB_UPDATE_DELAY_MS     1000
 
+/*
+ * Persistent reading log.
+ * Old rows are removed automatically when this limit is reached.
+ */
+#define APP_LOG_MAX_LINES           100
+
 #endif
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_logs\app_logs.c =====
+#include "app_logs.h"
+#include "app_config.h"
+
+#include "esp_log.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static const char *TAG = "APP_LOGS";
+
+#define LOG_FILE_PATH       "/spiffs/readings.csv"
+#define LOG_LINE_MAX        180
+#define LOG_CHUNK_MAX       512
+
+/*
+ * ESP8266 RTOS SDK has httpd_resp_send_chunk(),
+ * not httpd_resp_sendstr_chunk().
+ */
+static esp_err_t send_chunk(httpd_req_t *req, const char *text)
+{
+    if (req == NULL) {
+        return ESP_FAIL;
+    }
+
+    if (text == NULL) {
+        return httpd_resp_send_chunk(req, NULL, 0);
+    }
+
+    return httpd_resp_send_chunk(req, text, strlen(text));
+}
+
+void app_logs_init(void)
+{
+    FILE *file = fopen(LOG_FILE_PATH, "a");
+
+    if (file == NULL) {
+        ESP_LOGW(TAG, "Reading log not ready yet: %s", LOG_FILE_PATH);
+        return;
+    }
+
+    fclose(file);
+    ESP_LOGI(TAG, "Reading log ready: %s", LOG_FILE_PATH);
+}
+
+static void make_log_line(const app_system_state_t *state, char *out, size_t out_size)
+{
+    if (state == NULL || out == NULL || out_size == 0) {
+        return;
+    }
+
+    snprintf(
+        out,
+        out_size,
+        "%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+        state->update_count,
+        state->gas_raw,
+        state->flame_raw,
+        (int)(state->temperature_c * 10.0f),
+        (int)(state->humidity_percent * 10.0f),
+        (int)(state->heat_index_c * 10.0f),
+        (int)(state->distance_cm * 10.0f),
+        state->gas_connected ? 1 : 0,
+        state->flame_connected ? 1 : 0,
+        state->dht_connected ? 1 : 0,
+        state->ultrasonic_connected ? 1 : 0,
+        state->gas_warning ? 1 : 0,
+        state->flame_warning ? 1 : 0,
+        state->heat_index_warning ? 1 : 0,
+        state->distance_warning ? 1 : 0
+    );
+}
+
+bool app_logs_append_state(const app_system_state_t *state)
+{
+    if (state == NULL) {
+        return false;
+    }
+
+    char (*lines)[LOG_LINE_MAX] = calloc(APP_LOG_MAX_LINES, LOG_LINE_MAX);
+
+    if (lines == NULL) {
+        ESP_LOGW(TAG, "Unable to allocate log buffer");
+        return false;
+    }
+
+    int count = 0;
+    FILE *file = fopen(LOG_FILE_PATH, "r");
+
+    if (file != NULL) {
+        char line[LOG_LINE_MAX];
+
+        while (fgets(line, sizeof(line), file) != NULL) {
+            if (line[0] == '\0' || line[0] == '\n' || line[0] == '\r') {
+                continue;
+            }
+
+            if (count < APP_LOG_MAX_LINES - 1) {
+                strncpy(lines[count], line, LOG_LINE_MAX - 1);
+                lines[count][LOG_LINE_MAX - 1] = '\0';
+                count++;
+            } else {
+                for (int i = 1; i < APP_LOG_MAX_LINES - 1; i++) {
+                    strncpy(lines[i - 1], lines[i], LOG_LINE_MAX - 1);
+                    lines[i - 1][LOG_LINE_MAX - 1] = '\0';
+                }
+
+                strncpy(lines[APP_LOG_MAX_LINES - 2], line, LOG_LINE_MAX - 1);
+                lines[APP_LOG_MAX_LINES - 2][LOG_LINE_MAX - 1] = '\0';
+            }
+        }
+
+        fclose(file);
+    }
+
+    char new_line[LOG_LINE_MAX];
+    make_log_line(state, new_line, sizeof(new_line));
+
+    if (count < APP_LOG_MAX_LINES) {
+        strncpy(lines[count], new_line, LOG_LINE_MAX - 1);
+        lines[count][LOG_LINE_MAX - 1] = '\0';
+        count++;
+    }
+
+    file = fopen(LOG_FILE_PATH, "w");
+
+    if (file == NULL) {
+        free(lines);
+        ESP_LOGW(TAG, "Unable to write reading log");
+        return false;
+    }
+
+    for (int i = 0; i < count; i++) {
+        fputs(lines[i], file);
+    }
+
+    fclose(file);
+    free(lines);
+
+    return true;
+}
+
+static bool parse_log_line(
+    const char *line,
+    unsigned int *update_count,
+    int *gas_raw,
+    int *flame_raw,
+    int *temperature10,
+    int *humidity10,
+    int *heat_index10,
+    int *distance10,
+    int *gas_connected,
+    int *flame_connected,
+    int *dht_connected,
+    int *ultrasonic_connected,
+    int *gas_warning,
+    int *flame_warning,
+    int *heat_index_warning,
+    int *distance_warning
+)
+{
+    if (line == NULL) {
+        return false;
+    }
+
+    int parsed = sscanf(
+        line,
+        "%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+        update_count,
+        gas_raw,
+        flame_raw,
+        temperature10,
+        humidity10,
+        heat_index10,
+        distance10,
+        gas_connected,
+        flame_connected,
+        dht_connected,
+        ultrasonic_connected,
+        gas_warning,
+        flame_warning,
+        heat_index_warning,
+        distance_warning
+    );
+
+    return parsed == 15;
+}
+
+esp_err_t app_logs_send_json(httpd_req_t *req)
+{
+    if (req == NULL) {
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+
+    if (send_chunk(req, "{\"logs\":[") != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    FILE *file = fopen(LOG_FILE_PATH, "r");
+
+    if (file != NULL) {
+        char line[LOG_LINE_MAX];
+        bool first = true;
+
+        while (fgets(line, sizeof(line), file) != NULL) {
+            unsigned int update_count = 0;
+            int gas_raw = 0;
+            int flame_raw = 0;
+            int temperature10 = 0;
+            int humidity10 = 0;
+            int heat_index10 = 0;
+            int distance10 = 0;
+            int gas_connected = 0;
+            int flame_connected = 0;
+            int dht_connected = 0;
+            int ultrasonic_connected = 0;
+            int gas_warning = 0;
+            int flame_warning = 0;
+            int heat_index_warning = 0;
+            int distance_warning = 0;
+
+            if (!parse_log_line(
+                line,
+                &update_count,
+                &gas_raw,
+                &flame_raw,
+                &temperature10,
+                &humidity10,
+                &heat_index10,
+                &distance10,
+                &gas_connected,
+                &flame_connected,
+                &dht_connected,
+                &ultrasonic_connected,
+                &gas_warning,
+                &flame_warning,
+                &heat_index_warning,
+                &distance_warning
+            )) {
+                continue;
+            }
+
+            char chunk[LOG_CHUNK_MAX];
+
+            snprintf(
+                chunk,
+                sizeof(chunk),
+                "%s{\"update_count\":%u,\"gas_raw\":%d,\"flame_raw\":%d,\"temperature_c\":%d.%d,\"humidity_percent\":%d.%d,\"heat_index_c\":%d.%d,\"distance_cm\":%d.%d,\"gas_connected\":%s,\"flame_connected\":%s,\"dht_connected\":%s,\"ultrasonic_connected\":%s,\"gas_warning\":%s,\"flame_warning\":%s,\"heat_index_warning\":%s,\"distance_warning\":%s}",
+                first ? "" : ",",
+                update_count,
+                gas_raw,
+                flame_raw,
+                temperature10 / 10,
+                abs(temperature10 % 10),
+                humidity10 / 10,
+                abs(humidity10 % 10),
+                heat_index10 / 10,
+                abs(heat_index10 % 10),
+                distance10 / 10,
+                abs(distance10 % 10),
+                gas_connected ? "true" : "false",
+                flame_connected ? "true" : "false",
+                dht_connected ? "true" : "false",
+                ultrasonic_connected ? "true" : "false",
+                gas_warning ? "true" : "false",
+                flame_warning ? "true" : "false",
+                heat_index_warning ? "true" : "false",
+                distance_warning ? "true" : "false"
+            );
+
+            if (send_chunk(req, chunk) != ESP_OK) {
+                fclose(file);
+                return ESP_FAIL;
+            }
+
+            first = false;
+        }
+
+        fclose(file);
+    }
+
+    if (send_chunk(req, "]}") != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    return send_chunk(req, NULL);
+}
+
+bool app_logs_clear(void)
+{
+    FILE *file = fopen(LOG_FILE_PATH, "w");
+
+    if (file == NULL) {
+        return false;
+    }
+
+    fclose(file);
+    return true;
+}
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_logs\component.mk =====
+COMPONENT_SRCDIRS := .
+COMPONENT_ADD_INCLUDEDIRS := include
+
+COMPONENT_REQUIRES := app_config app_system esp_http_server spiffs vfs
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_logs\include\app_logs.h =====
+#ifndef APP_LOGS_H
+#define APP_LOGS_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "esp_err.h"
+#include "esp_http_server.h"
+#include "app_system.h"
+
+void app_logs_init(void);
+
+bool app_logs_append_state(const app_system_state_t *state);
+
+esp_err_t app_logs_send_json(httpd_req_t *req);
+
+bool app_logs_clear(void);
+
+#endif
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_ota\app_ota.c =====
+#include "app_ota.h"
+
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_spiffs.h"
+#include "esp_system.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static const char *TAG = "APP_OTA";
+
+#define OTA_RECV_BUFFER_SIZE       1024
+#define USERS_BACKUP_PATH          "/spiffs/users.dat"
+#define USERS_BACKUP_MAX_BYTES     4096
+
+static void ota_restart_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    esp_restart();
+}
+
+static void restart_after_response(void)
+{
+    xTaskCreate(ota_restart_task, "ota_restart", 1024, NULL, 5, NULL);
+}
+
+static void send_json(httpd_req_t *req, int status_code, const char *json)
+{
+    switch (status_code) {
+        case 200:
+            httpd_resp_set_status(req, "200 OK");
+            break;
+        case 400:
+            httpd_resp_set_status(req, "400 Bad Request");
+            break;
+        case 500:
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            break;
+        default:
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            break;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+}
+
+static void send_error(httpd_req_t *req, int status_code, const char *message)
+{
+    char json[160];
+    snprintf(json, sizeof(json), "{\"ok\":false,\"error\":\"%s\"}", message);
+    send_json(req, status_code, json);
+}
+
+static const char *safe_label(const esp_partition_t *partition)
+{
+    if (partition == NULL) {
+        return "none";
+    }
+
+    return partition->label;
+}
+
+void app_ota_get_status_json(char *out_json, size_t out_json_size)
+{
+    if (out_json == NULL || out_json_size == 0) {
+        return;
+    }
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+
+    const esp_partition_t *storage = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA,
+        ESP_PARTITION_SUBTYPE_ANY,
+        "storage"
+    );
+
+    snprintf(
+        out_json,
+        out_json_size,
+        "{"
+            "\"ok\":true,"
+            "\"running_partition\":\"%s\","
+            "\"boot_partition\":\"%s\","
+            "\"next_update_partition\":\"%s\","
+            "\"running_offset\":%u,"
+            "\"boot_offset\":%u,"
+            "\"next_update_offset\":%u,"
+            "\"next_update_size\":%u,"
+            "\"storage_offset\":%u,"
+            "\"storage_size\":%u"
+        "}",
+        safe_label(running),
+        safe_label(boot),
+        safe_label(next),
+        running ? running->address : 0,
+        boot ? boot->address : 0,
+        next ? next->address : 0,
+        next ? next->size : 0,
+        storage ? storage->address : 0,
+        storage ? storage->size : 0
+    );
+}
+
+esp_err_t app_ota_handle_firmware_upload(httpd_req_t *req)
+{
+    if (req == NULL) {
+        return ESP_FAIL;
+    }
+
+    if (req->content_len <= 0) {
+        send_error(req, 400, "Firmware file is empty");
+        return ESP_OK;
+    }
+
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+
+    if (update_partition == NULL) {
+        send_error(req, 500, "No OTA app partition found. Check partition table.");
+        return ESP_OK;
+    }
+
+    if ((size_t)req->content_len > update_partition->size) {
+        send_error(req, 400, "Firmware file is larger than OTA partition");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Starting firmware OTA: target=%s offset=0x%08x size=%u upload=%d",
+        update_partition->label,
+        update_partition->address,
+        update_partition->size,
+        req->content_len
+    );
+
+    esp_ota_handle_t ota_handle = 0;
+    esp_err_t err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &ota_handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %d", err);
+        send_error(req, 500, "Failed to start firmware OTA");
+        return ESP_OK;
+    }
+
+    char buffer[OTA_RECV_BUFFER_SIZE];
+    int remaining = req->content_len;
+    size_t written = 0;
+
+    while (remaining > 0) {
+        int to_read = remaining > OTA_RECV_BUFFER_SIZE ? OTA_RECV_BUFFER_SIZE : remaining;
+        int received = httpd_req_recv(req, buffer, to_read);
+
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+
+        if (received <= 0) {
+            ESP_LOGE(TAG, "Firmware upload receive failed: %d", received);
+
+            /*
+             * ESP8266 RTOS SDK version used here does not provide esp_ota_abort().
+             * esp_ota_end() is used to close the OTA handle safely.
+             */
+            (void)esp_ota_end(ota_handle);
+
+            send_error(req, 500, "Firmware upload failed while receiving data");
+            return ESP_OK;
+        }
+
+        err = esp_ota_write(ota_handle, buffer, received);
+
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed: %d", err);
+
+            /*
+             * ESP8266 RTOS SDK version used here does not provide esp_ota_abort().
+             * esp_ota_end() is used to close the OTA handle safely.
+             */
+            (void)esp_ota_end(ota_handle);
+
+            send_error(req, 500, "Failed to write firmware to flash");
+            return ESP_OK;
+        }
+
+        written += (size_t)received;
+        remaining -= received;
+    }
+
+    err = esp_ota_end(ota_handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed: %d", err);
+        send_error(req, 500, "Firmware image is invalid or incomplete");
+        return ESP_OK;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %d", err);
+        send_error(req, 500, "Firmware written but boot partition could not be changed");
+        return ESP_OK;
+    }
+
+    char json[220];
+    snprintf(
+        json,
+        sizeof(json),
+        "{\"ok\":true,\"message\":\"Firmware OTA complete. Rebooting.\",\"partition\":\"%s\",\"bytes\":%u}",
+        update_partition->label,
+        (unsigned int)written
+    );
+
+    send_json(req, 200, json);
+    restart_after_response();
+
+    return ESP_OK;
+}
+
+static char *backup_users_file(size_t *out_size)
+{
+    if (out_size != NULL) {
+        *out_size = 0;
+    }
+
+    FILE *file = fopen(USERS_BACKUP_PATH, "rb");
+
+    if (file == NULL) {
+        return NULL;
+    }
+
+    char *buffer = (char *)malloc(USERS_BACKUP_MAX_BYTES + 1);
+
+    if (buffer == NULL) {
+        fclose(file);
+        return NULL;
+    }
+
+    size_t used = fread(buffer, 1, USERS_BACKUP_MAX_BYTES, file);
+    fclose(file);
+
+    buffer[used] = '\0';
+
+    if (out_size != NULL) {
+        *out_size = used;
+    }
+
+    return buffer;
+}
+
+static bool restore_users_file(const char *buffer, size_t size)
+{
+    if (buffer == NULL || size == 0) {
+        return true;
+    }
+
+    FILE *file = fopen(USERS_BACKUP_PATH, "wb");
+
+    if (file == NULL) {
+        return false;
+    }
+
+    size_t written = fwrite(buffer, 1, size, file);
+    fclose(file);
+
+    return written == size;
+}
+
+static bool mount_spiffs_after_update(void)
+{
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = "storage",
+        .max_files = 5,
+        .format_if_mount_failed = false
+    };
+
+    esp_err_t err = esp_vfs_spiffs_register(&conf);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to remount SPIFFS after UI OTA: %d", err);
+        return false;
+    }
+
+    return true;
+}
+
+esp_err_t app_ota_handle_spiffs_upload(httpd_req_t *req)
+{
+    if (req == NULL) {
+        return ESP_FAIL;
+    }
+
+    if (req->content_len <= 0) {
+        send_error(req, 400, "SPIFFS image is empty");
+        return ESP_OK;
+    }
+
+    const esp_partition_t *storage_partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA,
+        ESP_PARTITION_SUBTYPE_ANY,
+        "storage"
+    );
+
+    if (storage_partition == NULL) {
+        send_error(req, 500, "Storage partition not found");
+        return ESP_OK;
+    }
+
+    if ((size_t)req->content_len > storage_partition->size) {
+        send_error(req, 400, "SPIFFS image is larger than storage partition");
+        return ESP_OK;
+    }
+
+    size_t users_backup_size = 0;
+    char *users_backup = backup_users_file(&users_backup_size);
+
+    if (users_backup != NULL && users_backup_size > 0) {
+        ESP_LOGI(TAG, "Backed up %u bytes from users.dat", (unsigned int)users_backup_size);
+    }
+
+    /*
+     * The storage partition is about to be erased and rewritten.
+     * It must not stay mounted while writing raw flash data.
+     */
+    esp_vfs_spiffs_unregister("storage");
+
+    ESP_LOGI(
+        TAG,
+        "Starting SPIFFS OTA: target=%s offset=0x%08x size=%u upload=%d",
+        storage_partition->label,
+        storage_partition->address,
+        storage_partition->size,
+        req->content_len
+    );
+
+    esp_err_t err = esp_partition_erase_range(storage_partition, 0, storage_partition->size);
+
+    if (err != ESP_OK) {
+        free(users_backup);
+        ESP_LOGE(TAG, "Failed to erase SPIFFS partition: %d", err);
+        send_error(req, 500, "Failed to erase SPIFFS partition");
+        return ESP_OK;
+    }
+
+    char buffer[OTA_RECV_BUFFER_SIZE];
+    int remaining = req->content_len;
+    size_t offset = 0;
+
+    while (remaining > 0) {
+        int to_read = remaining > OTA_RECV_BUFFER_SIZE ? OTA_RECV_BUFFER_SIZE : remaining;
+        int received = httpd_req_recv(req, buffer, to_read);
+
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+
+        if (received <= 0) {
+            free(users_backup);
+            ESP_LOGE(TAG, "SPIFFS upload receive failed: %d", received);
+            send_error(req, 500, "SPIFFS upload failed while receiving data");
+            return ESP_OK;
+        }
+
+        err = esp_partition_write(storage_partition, offset, buffer, received);
+
+        if (err != ESP_OK) {
+            free(users_backup);
+            ESP_LOGE(TAG, "Failed to write SPIFFS data: %d", err);
+            send_error(req, 500, "Failed to write SPIFFS image to flash");
+            return ESP_OK;
+        }
+
+        offset += (size_t)received;
+        remaining -= received;
+    }
+
+    bool users_restored = false;
+
+    if (mount_spiffs_after_update()) {
+        users_restored = restore_users_file(users_backup, users_backup_size);
+
+        if (!users_restored && users_backup_size > 0) {
+            ESP_LOGW(TAG, "SPIFFS image written, but users.dat could not be restored");
+        }
+    }
+
+    free(users_backup);
+
+    char json[260];
+    snprintf(
+        json,
+        sizeof(json),
+        "{\"ok\":true,\"message\":\"SPIFFS/UI OTA complete. Rebooting.\",\"bytes\":%u,\"users_restored\":%s}",
+        (unsigned int)offset,
+        users_restored ? "true" : "false"
+    );
+
+    send_json(req, 200, json);
+    restart_after_response();
+
+    return ESP_OK;
+}
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_ota\component.mk =====
+COMPONENT_SRCDIRS := .
+COMPONENT_ADD_INCLUDEDIRS := include
+
+COMPONENT_REQUIRES := app_update esp_http_server spi_flash spiffs vfs
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_ota\include\app_ota.h =====
+#ifndef APP_OTA_H
+#define APP_OTA_H
+
+#include <stddef.h>
+#include "esp_err.h"
+#include "esp_http_server.h"
+
+/*
+ * Returns OTA information as JSON.
+ * out_json should be at least 512 bytes.
+ */
+void app_ota_get_status_json(char *out_json, size_t out_json_size);
+
+/*
+ * Handles raw binary firmware upload.
+ * Browser must POST the application .bin directly as the request body.
+ */
+esp_err_t app_ota_handle_firmware_upload(httpd_req_t *req);
+
+/*
+ * Handles raw SPIFFS image upload.
+ * Browser must POST spiffs.bin directly as the request body.
+ */
+esp_err_t app_ota_handle_spiffs_upload(httpd_req_t *req);
+
+#endif
+
 
 
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_outputs\app_outputs.c =====
@@ -905,11 +1829,59 @@ void app_outputs_set_buzzer(bool on);
 #include "app_system.h"
 
 #include "driver/gpio.h"
+#include "driver/adc.h"
 #include "esp_log.h"
+#include "esp_err.h"
+#include "esp8266/rom_functions.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include <string.h>
 
 static const char *TAG = "APP_SENSORS";
+
+#define ADC_SAMPLE_COUNT                10
+#define ADC_FLOATING_SPREAD_LIMIT       350
+#define ADC_MIN_VALID_VALUE             4
+#define ADC_MAX_VALID_VALUE             1019
+
+#define DHT_START_LOW_MS                20
+#define DHT_TIMEOUT_US                  120
+#define DHT_BIT_THRESHOLD_US            45
+
+#define ULTRASONIC_TIMEOUT_US           30000
+
+static void delay_us(uint32_t us)
+{
+    ets_delay_us(us);
+}
+
+static void configure_input_pin(int gpio, bool pullup)
+{
+    gpio_config_t conf = {
+        .pin_bit_mask = (1ULL << gpio),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = pullup ? 1 : 0,
+        .pull_down_en = 0,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    gpio_config(&conf);
+}
+
+static void configure_output_pin(int gpio)
+{
+    gpio_config_t conf = {
+        .pin_bit_mask = (1ULL << gpio),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = 0,
+        .pull_down_en = 0,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    gpio_config(&conf);
+}
 
 void app_sensors_init(void)
 {
@@ -917,35 +1889,278 @@ void app_sensors_init(void)
 
     const app_system_pin_config_t *pins = app_system_get_pins();
 
-    gpio_config_t trig_conf = {
-        .pin_bit_mask = (1ULL << pins->ultrasonic_trig_gpio),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = 0,
-        .pull_down_en = 0,
-        .intr_type = GPIO_INTR_DISABLE
+    adc_config_t adc_config = {
+        .mode = ADC_READ_TOUT_MODE,
+        .clk_div = 8
     };
-    gpio_config(&trig_conf);
 
-    gpio_config_t echo_conf = {
-        .pin_bit_mask = (1ULL << pins->ultrasonic_echo_gpio),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = 0,
-        .pull_down_en = 0,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&echo_conf);
+    esp_err_t adc_err = adc_init(&adc_config);
+
+    if (adc_err != ESP_OK) {
+        ESP_LOGW(TAG, "ADC init failed: %d", adc_err);
+    }
+
+    configure_input_pin(pins->gas_digital_gpio, false);
+    configure_input_pin(pins->dht_gpio, true);
+    configure_output_pin(pins->ultrasonic_trig_gpio);
+    configure_input_pin(pins->ultrasonic_echo_gpio, false);
 
     gpio_set_level(pins->ultrasonic_trig_gpio, 0);
 
     ESP_LOGI(
         TAG,
-        "Sensors initialized: gas_adc=%d flame_adc=%d dht_gpio=%d trig_gpio=%d echo_gpio=%d",
-        pins->gas_adc_channel,
+        "Sensors initialized: gas_digital_gpio=%d flame_adc=%d dht_gpio=%d trig_gpio=%d echo_gpio=%d",
+        pins->gas_digital_gpio,
         pins->flame_adc_channel,
         pins->dht_gpio,
         pins->ultrasonic_trig_gpio,
         pins->ultrasonic_echo_gpio
     );
+}
+
+static bool read_adc_average(int *out_value)
+{
+    if (out_value == NULL) {
+        return false;
+    }
+
+    int min_value = 1023;
+    int max_value = 0;
+    int sum = 0;
+    int valid_samples = 0;
+
+    for (int i = 0; i < ADC_SAMPLE_COUNT; i++) {
+        uint16_t raw = 0;
+        esp_err_t err = adc_read(&raw);
+
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "ADC read failed: %d", err);
+            return false;
+        }
+
+        int value = (int)raw;
+
+        if (value < min_value) {
+            min_value = value;
+        }
+
+        if (value > max_value) {
+            max_value = value;
+        }
+
+        sum += value;
+        valid_samples++;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    if (valid_samples == 0) {
+        return false;
+    }
+
+    int average = sum / valid_samples;
+    int spread = max_value - min_value;
+
+    *out_value = average;
+
+    if (average <= ADC_MIN_VALID_VALUE || average >= ADC_MAX_VALID_VALUE) {
+        return false;
+    }
+
+    if (spread > ADC_FLOATING_SPREAD_LIMIT) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool read_gas_digital(int gpio, int *out_value)
+{
+    if (out_value == NULL) {
+        return false;
+    }
+
+    int high_count = 0;
+    int low_count = 0;
+
+    for (int i = 0; i < 20; i++) {
+        int level = gpio_get_level(gpio);
+
+        if (level) {
+            high_count++;
+        } else {
+            low_count++;
+        }
+
+        delay_us(250);
+    }
+
+    /* Mixed HIGH/LOW samples means the wire is probably floating or unstable. */
+    if (high_count > 0 && low_count > 0) {
+        return false;
+    }
+
+    bool active_level = false;
+
+#if APP_GAS_DIGITAL_ACTIVE_LOW
+    active_level = (low_count > 0);
+#else
+    active_level = (high_count > 0);
+#endif
+
+    /* Keep the API compatible: 1023 means gas warning, 0 means normal. */
+    *out_value = active_level ? 1023 : 0;
+    return true;
+}
+
+static bool wait_for_level(int gpio, int expected_level, uint32_t timeout_us, uint32_t *out_waited_us)
+{
+    uint32_t waited = 0;
+
+    while (gpio_get_level(gpio) != expected_level) {
+        if (waited >= timeout_us) {
+            if (out_waited_us != NULL) {
+                *out_waited_us = waited;
+            }
+
+            return false;
+        }
+
+        delay_us(1);
+        waited++;
+    }
+
+    if (out_waited_us != NULL) {
+        *out_waited_us = waited;
+    }
+
+    return true;
+}
+
+static bool read_dht_sensor(int gpio, float *out_temp_c, float *out_humidity)
+{
+    if (out_temp_c == NULL || out_humidity == NULL) {
+        return false;
+    }
+
+    uint8_t bytes[5] = {0};
+
+    configure_output_pin(gpio);
+    gpio_set_level(gpio, 1);
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    gpio_set_level(gpio, 0);
+    vTaskDelay(pdMS_TO_TICKS(DHT_START_LOW_MS));
+
+    gpio_set_level(gpio, 1);
+    delay_us(40);
+
+    configure_input_pin(gpio, true);
+
+    if (!wait_for_level(gpio, 0, DHT_TIMEOUT_US, NULL)) {
+        return false;
+    }
+
+    if (!wait_for_level(gpio, 1, DHT_TIMEOUT_US, NULL)) {
+        return false;
+    }
+
+    if (!wait_for_level(gpio, 0, DHT_TIMEOUT_US, NULL)) {
+        return false;
+    }
+
+    for (int bit = 0; bit < 40; bit++) {
+        if (!wait_for_level(gpio, 1, DHT_TIMEOUT_US, NULL)) {
+            return false;
+        }
+
+        uint32_t high_time = 0;
+
+        while (gpio_get_level(gpio) == 1) {
+            if (high_time >= DHT_TIMEOUT_US) {
+                return false;
+            }
+
+            delay_us(1);
+            high_time++;
+        }
+
+        bytes[bit / 8] <<= 1;
+
+        if (high_time > DHT_BIT_THRESHOLD_US) {
+            bytes[bit / 8] |= 1;
+        }
+    }
+
+    uint8_t checksum = (uint8_t)(bytes[0] + bytes[1] + bytes[2] + bytes[3]);
+
+    if (checksum != bytes[4]) {
+        return false;
+    }
+
+    if (bytes[1] == 0 && bytes[3] == 0 && bytes[0] <= 100 && bytes[2] <= 80) {
+        *out_humidity = (float)bytes[0];
+        *out_temp_c = (float)bytes[2];
+    } else {
+        uint16_t raw_humidity = ((uint16_t)bytes[0] << 8) | bytes[1];
+        uint16_t raw_temp = ((uint16_t)bytes[2] << 8) | bytes[3];
+
+        bool negative = (raw_temp & 0x8000) != 0;
+        raw_temp &= 0x7FFF;
+
+        *out_humidity = (float)raw_humidity / 10.0f;
+        *out_temp_c = (float)raw_temp / 10.0f;
+
+        if (negative) {
+            *out_temp_c = -*out_temp_c;
+        }
+    }
+
+    if (*out_humidity < 0.0f || *out_humidity > 100.0f) {
+        return false;
+    }
+
+    if (*out_temp_c < -40.0f || *out_temp_c > 85.0f) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool read_ultrasonic_cm(int trig_gpio, int echo_gpio, float *out_distance_cm)
+{
+    if (out_distance_cm == NULL) {
+        return false;
+    }
+
+    gpio_set_level(trig_gpio, 0);
+    delay_us(3);
+    gpio_set_level(trig_gpio, 1);
+    delay_us(10);
+    gpio_set_level(trig_gpio, 0);
+
+    if (!wait_for_level(echo_gpio, 1, ULTRASONIC_TIMEOUT_US, NULL)) {
+        return false;
+    }
+
+    uint32_t pulse_width_us = 0;
+
+    while (gpio_get_level(echo_gpio) == 1) {
+        if (pulse_width_us >= ULTRASONIC_TIMEOUT_US) {
+            return false;
+        }
+
+        delay_us(1);
+        pulse_width_us++;
+    }
+
+    float distance_cm = (float)pulse_width_us / 58.0f;
+
+    if (distance_cm < 2.0f || distance_cm > 450.0f) {
+        return false;
+    }
+
+    *out_distance_cm = distance_cm;
+    return true;
 }
 
 bool app_sensors_read(app_sensor_data_t *data)
@@ -957,12 +2172,7 @@ bool app_sensors_read(app_sensor_data_t *data)
     memset(data, 0, sizeof(app_sensor_data_t));
 
 #if APP_SENSOR_USE_TEST_VALUES
-    /*
-     * Demo mode only.
-     * Enable APP_SENSOR_USE_TEST_VALUES in app_config.h when you want to test
-     * the web UI without real sensors connected.
-     */
-    data->gas_raw = 350;
+    data->gas_raw = 0;
     data->flame_raw = 820;
     data->temperature_c = 30.0f;
     data->humidity_percent = 68.0f;
@@ -975,33 +2185,46 @@ bool app_sensors_read(app_sensor_data_t *data)
 
     return true;
 #else
-    /*
-     * Real sensor drivers are not implemented yet.
-     *
-     * Returning false is intentional: the dashboard must not show fake sensor
-     * data as if real hardware is connected.
-     *
-     * Next step:
-     * - read MQ gas sensor from A0 or external ADC and set gas_ok
-     * - read flame sensor from A0 or external ADC and set flame_ok
-     * - read DHT temperature/humidity and set dht_ok
-     * - read ultrasonic echo pulse and set ultrasonic_ok
-     */
-    data->gas_ok = false;
-    data->flame_ok = false;
-    data->dht_ok = false;
-    data->ultrasonic_ok = false;
+    const app_system_pin_config_t *pins = app_system_get_pins();
 
-    return false;
+    data->gas_ok = read_gas_digital(pins->gas_digital_gpio, &data->gas_raw);
+    data->flame_ok = read_adc_average(&data->flame_raw);
+    data->dht_ok = read_dht_sensor(pins->dht_gpio, &data->temperature_c, &data->humidity_percent);
+    data->ultrasonic_ok = read_ultrasonic_cm(
+        pins->ultrasonic_trig_gpio,
+        pins->ultrasonic_echo_gpio,
+        &data->distance_cm
+    );
+
+    if (!data->gas_ok) {
+        data->gas_raw = 0;
+    }
+
+    if (!data->flame_ok) {
+        data->flame_raw = 0;
+    }
+
+    if (!data->dht_ok) {
+        data->temperature_c = 0.0f;
+        data->humidity_percent = 0.0f;
+    }
+
+    if (!data->ultrasonic_ok) {
+        data->distance_cm = 999.0f;
+    }
+
+    return data->gas_ok || data->flame_ok || data->dht_ok || data->ultrasonic_ok;
 #endif
 }
+
 
 
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_sensors\component.mk =====
 COMPONENT_SRCDIRS := .
 COMPONENT_ADD_INCLUDEDIRS := include
 
-COMPONENT_REQUIRES := app_config app_system
+COMPONENT_REQUIRES := app_config app_system driver
+
 
 
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_sensors\include\app_sensors.h =====
@@ -1053,7 +2276,7 @@ static const char *TAG = "APP_SYSTEM";
 #define NVS_KEY_DISTANCE           "dist_warn"
 
 /* Pin keys */
-#define NVS_KEY_GAS_ADC            "gas_adc"
+#define NVS_KEY_GAS_DIGITAL        "gas_dig"
 #define NVS_KEY_FLAME_ADC          "flame_adc"
 #define NVS_KEY_DHT_GPIO           "dht_gpio"
 #define NVS_KEY_TRIG_GPIO          "trig_gpio"
@@ -1106,7 +2329,7 @@ static void load_default_thresholds(void)
 
 static void load_default_pins(void)
 {
-    pin_config.gas_adc_channel = APP_GAS_ADC_CHANNEL;
+    pin_config.gas_digital_gpio = APP_GAS_DIGITAL_GPIO;
     pin_config.flame_adc_channel = APP_FLAME_ADC_CHANNEL;
 
     pin_config.dht_gpio = APP_DHT_GPIO;
@@ -1177,8 +2400,8 @@ static void load_pins_from_nvs(void)
 
     int32_t value;
 
-    if (nvs_get_i32(handle, NVS_KEY_GAS_ADC, &value) == ESP_OK) {
-        pin_config.gas_adc_channel = (int)value;
+    if (nvs_get_i32(handle, NVS_KEY_GAS_DIGITAL, &value) == ESP_OK) {
+        pin_config.gas_digital_gpio = (int)value;
     }
 
     if (nvs_get_i32(handle, NVS_KEY_FLAME_ADC, &value) == ESP_OK) {
@@ -1221,8 +2444,8 @@ static void load_pins_from_nvs(void)
 
     ESP_LOGI(
         TAG,
-        "Loaded pins: gas_adc=%d flame_adc=%d dht=%d trig=%d echo=%d led_gas=%d led_flame=%d led_heat=%d led_dist=%d buzzer=%d",
-        pin_config.gas_adc_channel,
+        "Loaded pins: gas_digital=%d flame_adc=%d dht=%d trig=%d echo=%d led_gas=%d led_flame=%d led_heat=%d led_dist=%d buzzer=%d",
+        pin_config.gas_digital_gpio,
         pin_config.flame_adc_channel,
         pin_config.dht_gpio,
         pin_config.ultrasonic_trig_gpio,
@@ -1273,7 +2496,7 @@ static bool save_pins_to_nvs(const app_system_pin_config_t *pins)
 
     bool ok = true;
 
-    ok &= (nvs_set_i32(handle, NVS_KEY_GAS_ADC, pins->gas_adc_channel) == ESP_OK);
+    ok &= (nvs_set_i32(handle, NVS_KEY_GAS_DIGITAL, pins->gas_digital_gpio) == ESP_OK);
     ok &= (nvs_set_i32(handle, NVS_KEY_FLAME_ADC, pins->flame_adc_channel) == ESP_OK);
 
     ok &= (nvs_set_i32(handle, NVS_KEY_DHT_GPIO, pins->dht_gpio) == ESP_OK);
@@ -1303,16 +2526,14 @@ static bool gpio_is_valid(int gpio)
 
 static bool adc_channel_is_valid(int channel)
 {
-    /*
-     * ESP8266 internal ADC is channel 0 only.
-     * Channels above 0 are allowed here only for future external ADC/multiplexer logic.
-     */
-    return channel >= 0 && channel <= 7;
+    /* ESP8266 internal ADC is A0 only in this firmware. */
+    return channel == 0;
 }
 
 static bool digital_pin_used_twice(const app_system_pin_config_t *pins)
 {
     int values[] = {
+        pins->gas_digital_gpio,
         pins->dht_gpio,
         pins->ultrasonic_trig_gpio,
         pins->ultrasonic_echo_gpio,
@@ -1342,7 +2563,7 @@ static bool pin_config_is_valid(const app_system_pin_config_t *pins)
         return false;
     }
 
-    if (!adc_channel_is_valid(pins->gas_adc_channel)) {
+    if (!gpio_is_valid(pins->gas_digital_gpio)) {
         return false;
     }
 
@@ -1573,8 +2794,8 @@ bool app_system_set_pins(const app_system_pin_config_t *pins)
 
     ESP_LOGI(
         TAG,
-        "Pins updated: gas_adc=%d flame_adc=%d dht=%d trig=%d echo=%d led_gas=%d led_flame=%d led_heat=%d led_dist=%d buzzer=%d",
-        pin_config.gas_adc_channel,
+        "Pins updated: gas_digital=%d flame_adc=%d dht=%d trig=%d echo=%d led_gas=%d led_flame=%d led_heat=%d led_dist=%d buzzer=%d",
+        pin_config.gas_digital_gpio,
         pin_config.flame_adc_channel,
         pin_config.dht_gpio,
         pin_config.ultrasonic_trig_gpio,
@@ -1588,6 +2809,8 @@ bool app_system_set_pins(const app_system_pin_config_t *pins)
 
     return true;
 }
+
+
 
 
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_system\component.mk =====
@@ -1646,7 +2869,7 @@ typedef struct
 
 typedef struct
 {
-    int gas_adc_channel;
+    int gas_digital_gpio;
     int flame_adc_channel;
 
     int dht_gpio;
@@ -1695,6 +2918,8 @@ bool app_system_set_pins(const app_system_pin_config_t *pins);
 #endif
 
 
+
+
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_webserver\app_webserver.c =====
 #include "app_webserver.h"
 #include "app_system.h"
@@ -1702,6 +2927,9 @@ bool app_system_set_pins(const app_system_pin_config_t *pins);
 #include "app_wifi.h"
 #include "app_auth.h"
 #include "app_outputs.h"
+#include "app_sensors.h"
+#include "app_ota.h"
+#include "app_logs.h"
 #include "json_min.h"
 
 #include "esp_http_server.h"
@@ -1990,6 +3218,9 @@ static void send_json_response(httpd_req_t *req, int status_code, const char *js
         case 401:
             httpd_resp_set_status(req, "401 Unauthorized");
             break;
+        case 403:
+            httpd_resp_set_status(req, "403 Forbidden");
+            break;
         case 409:
             httpd_resp_set_status(req, "409 Conflict");
             break;
@@ -2086,6 +3317,22 @@ static bool require_auth(httpd_req_t *req, char *out_email, size_t out_email_siz
     return true;
 }
 
+static bool require_admin(httpd_req_t *req)
+{
+    char email[APP_AUTH_USERNAME_MAX];
+
+    if (!require_auth(req, email, sizeof(email))) {
+        return false;
+    }
+
+    if (!app_auth_is_admin_email(email)) {
+        send_json_error(req, 403, "Admin access required");
+        return false;
+    }
+
+    return true;
+}
+
 /* ---------- Static files ---------- */
 
 static esp_err_t root_handler(httpd_req_t *req)
@@ -2123,7 +3370,10 @@ static esp_err_t status_handler(httpd_req_t *req)
     format_float_1(state->heat_index_c, heat_index_text, sizeof(heat_index_text));
     format_float_1(state->distance_cm, distance_text, sizeof(distance_text));
 
-    char json[1300];
+    char safe_ssid[APP_WIFI_SSID_MAX_LEN * 2];
+    json_escape_string(app_wifi_get_active_ssid(), safe_ssid, sizeof(safe_ssid));
+
+    char json[1400];
 
     snprintf(
         json,
@@ -2137,6 +3387,7 @@ static esp_err_t status_handler(httpd_req_t *req)
         "\"distance_cm\":%s,"
 
         "\"wifi_connected\":%s,"
+        "\"wifi_ssid\":\"%s\","
         "\"system_alive\":%s,"
 
         "\"gas_connected\":%s,"
@@ -2168,6 +3419,7 @@ static esp_err_t status_handler(httpd_req_t *req)
         distance_text,
 
         state->wifi_connected ? "true" : "false",
+        safe_ssid,
         state->system_alive ? "true" : "false",
 
         state->gas_connected ? "true" : "false",
@@ -2343,15 +3595,30 @@ static esp_err_t auth_me_handler(httpd_req_t *req)
     snprintf(
         json,
         sizeof(json),
-        "{\"ok\":true,\"email\":\"%s\",\"name\":\"%s\"}",
+        "{\"ok\":true,\"email\":\"%s\",\"name\":\"%s\",\"is_admin\":%s}",
         safe_email,
-        safe_name
+        safe_name,
+        app_auth_is_admin_email(email) ? "true" : "false"
     );
 
     send_json_response(req, 200, json);
 
     return ESP_OK;
 }
+
+static esp_err_t auth_users_handler(httpd_req_t *req)
+{
+    if (!require_admin(req)) {
+        return ESP_OK;
+    }
+
+    char json[2048];
+    app_auth_users_json(json, sizeof(json));
+    send_json_response(req, 200, json);
+
+    return ESP_OK;
+}
+
 
 /* ---------- Wi-Fi ---------- */
 
@@ -2528,7 +3795,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
 
     const app_system_pin_config_t *pins = app_system_get_pins();
 
-    char gas_adc_label[16];
+    char gas_digital_label[16];
     char flame_adc_label[16];
 
     char dht_label[16];
@@ -2542,7 +3809,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
 
     char buzzer_label[16];
 
-    adc_to_label(pins->gas_adc_channel, gas_adc_label, sizeof(gas_adc_label));
+    gpio_to_label(pins->gas_digital_gpio, gas_digital_label, sizeof(gas_digital_label));
     adc_to_label(pins->flame_adc_channel, flame_adc_label, sizeof(flame_adc_label));
 
     gpio_to_label(pins->dht_gpio, dht_label, sizeof(dht_label));
@@ -2563,7 +3830,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
         sizeof(json),
         "{"
         "\"pins\":{"
-            "\"gas_adc_channel\":%d,"
+            "\"gas_digital_gpio\":%d,"
             "\"flame_adc_channel\":%d,"
             "\"dht_gpio\":%d,"
             "\"ultrasonic_trig_gpio\":%d,"
@@ -2574,7 +3841,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
             "\"led_distance_gpio\":%d,"
             "\"buzzer_gpio\":%d,"
 
-            "\"gas_adc\":\"%s\","
+            "\"gas_digital\":\"%s\","
             "\"flame_adc\":\"%s\","
             "\"dht_data\":\"%s\","
             "\"ultrasonic_trig\":\"%s\","
@@ -2586,7 +3853,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
             "\"buzzer\":\"%s\""
         "}"
         "}",
-        pins->gas_adc_channel,
+        pins->gas_digital_gpio,
         pins->flame_adc_channel,
         pins->dht_gpio,
         pins->ultrasonic_trig_gpio,
@@ -2597,7 +3864,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
         pins->led_distance_gpio,
         pins->buzzer_gpio,
 
-        gas_adc_label,
+        gas_digital_label,
         flame_adc_label,
         dht_label,
         trig_label,
@@ -2632,7 +3899,7 @@ static esp_err_t pins_post_handler(httpd_req_t *req)
 
     new_pins = *current;
 
-    get_adc_from_json(body, "gas_adc_channel", "gas_adc", &new_pins.gas_adc_channel);
+    get_gpio_from_json(body, "gas_digital_gpio", "gas_digital", &new_pins.gas_digital_gpio);
     get_adc_from_json(body, "flame_adc_channel", "flame_adc", &new_pins.flame_adc_channel);
 
     get_gpio_from_json(body, "dht_gpio", "dht_data", &new_pins.dht_gpio);
@@ -2651,10 +3918,40 @@ static esp_err_t pins_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    send_json_response(req, 200, "{\"ok\":true}");
+    app_outputs_init();
+    app_sensors_init();
+
+    send_json_response(req, 200, "{\"ok\":true,\"message\":\"Pin configuration saved and applied\"}");
 
     return ESP_OK;
 }
+
+/* ---------- Persistent logs ---------- */
+
+static esp_err_t logs_get_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    return app_logs_send_json(req);
+}
+
+static esp_err_t logs_clear_handler(httpd_req_t *req)
+{
+    if (!require_admin(req)) {
+        return ESP_OK;
+    }
+
+    if (!app_logs_clear()) {
+        send_json_error(req, 500, "Failed to clear logs");
+        return ESP_OK;
+    }
+
+    send_json_response(req, 200, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 
 /* ---------- Commands ---------- */
 
@@ -2693,6 +3990,38 @@ static esp_err_t system_restart_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+
+static esp_err_t ota_status_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    char json[512];
+    app_ota_get_status_json(json, sizeof(json));
+    send_json_response(req, 200, json);
+
+    return ESP_OK;
+}
+
+static esp_err_t ota_firmware_upload_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    return app_ota_handle_firmware_upload(req);
+}
+
+static esp_err_t ota_spiffs_upload_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    return app_ota_handle_spiffs_upload(req);
+}
+
 /* ---------- Server setup ---------- */
 
 void app_webserver_init(void)
@@ -2704,7 +4033,7 @@ void app_webserver_init(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 36;
     config.stack_size = 6144;
 
     ESP_LOGI(TAG, "Starting web server");
@@ -2719,6 +4048,7 @@ void app_webserver_init(void)
         httpd_uri_t login_uri = { .uri = "/api/auth/login", .method = HTTP_POST, .handler = auth_login_handler, .user_ctx = NULL };
         httpd_uri_t logout_uri = { .uri = "/api/auth/logout", .method = HTTP_POST, .handler = auth_logout_handler, .user_ctx = NULL };
         httpd_uri_t me_uri = { .uri = "/api/auth/me", .method = HTTP_GET, .handler = auth_me_handler, .user_ctx = NULL };
+        httpd_uri_t users_uri = { .uri = "/api/auth/users", .method = HTTP_GET, .handler = auth_users_handler, .user_ctx = NULL };
 
         httpd_uri_t wifi_scan_uri = { .uri = "/api/wifi/scan", .method = HTTP_GET, .handler = wifi_scan_handler, .user_ctx = NULL };
         httpd_uri_t wifi_connect_uri = { .uri = "/api/wifi/connect", .method = HTTP_POST, .handler = wifi_connect_handler, .user_ctx = NULL };
@@ -2731,6 +4061,13 @@ void app_webserver_init(void)
         httpd_uri_t alarm_test_uri = { .uri = "/api/alarm/test", .method = HTTP_POST, .handler = alarm_test_handler, .user_ctx = NULL };
         httpd_uri_t restart_uri = { .uri = "/api/system/restart", .method = HTTP_POST, .handler = system_restart_handler, .user_ctx = NULL };
 
+        httpd_uri_t logs_get_uri = { .uri = "/api/logs", .method = HTTP_GET, .handler = logs_get_handler, .user_ctx = NULL };
+        httpd_uri_t logs_clear_uri = { .uri = "/api/logs/clear", .method = HTTP_POST, .handler = logs_clear_handler, .user_ctx = NULL };
+
+        httpd_uri_t ota_status_uri = { .uri = "/api/ota/status", .method = HTTP_GET, .handler = ota_status_handler, .user_ctx = NULL };
+        httpd_uri_t ota_firmware_uri = { .uri = "/api/ota/firmware", .method = HTTP_POST, .handler = ota_firmware_upload_handler, .user_ctx = NULL };
+        httpd_uri_t ota_spiffs_uri = { .uri = "/api/ota/spiffs", .method = HTTP_POST, .handler = ota_spiffs_upload_handler, .user_ctx = NULL };
+
         register_uri_checked(&root_uri);
         register_uri_checked(&css_uri);
         register_uri_checked(&js_uri);
@@ -2740,6 +4077,7 @@ void app_webserver_init(void)
         register_uri_checked(&login_uri);
         register_uri_checked(&logout_uri);
         register_uri_checked(&me_uri);
+        register_uri_checked(&users_uri);
 
         register_uri_checked(&wifi_scan_uri);
         register_uri_checked(&wifi_connect_uri);
@@ -2752,6 +4090,13 @@ void app_webserver_init(void)
         register_uri_checked(&alarm_test_uri);
         register_uri_checked(&restart_uri);
 
+        register_uri_checked(&logs_get_uri);
+        register_uri_checked(&logs_clear_uri);
+
+        register_uri_checked(&ota_status_uri);
+        register_uri_checked(&ota_firmware_uri);
+        register_uri_checked(&ota_spiffs_uri);
+
         ESP_LOGI(TAG, "Web server started");
     } else {
         ESP_LOGE(TAG, "Failed to start web server");
@@ -2759,11 +4104,18 @@ void app_webserver_init(void)
 }
 
 
+
+
+
+
+
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_webserver\component.mk =====
 COMPONENT_SRCDIRS := .
 COMPONENT_ADD_INCLUDEDIRS := include
 
-COMPONENT_REQUIRES := esp_http_server app_system app_config app_wifi app_auth app_outputs spiffs vfs
+COMPONENT_REQUIRES := esp_http_server app_system app_config app_wifi app_auth app_outputs app_ota app_logs spiffs vfs
+
+
 
 
 
@@ -2934,13 +4286,86 @@ bool json_min_get_int(const char *json, const char *key, int *out);
 #include "esp_event_loop.h"
 #include "esp_log.h"
 #include "tcpip_adapter.h"
+#include "nvs.h"
 
 #include <string.h>
 
 static const char *TAG = "APP_WIFI";
 
+#define WIFI_NVS_NAMESPACE  "wifi_cfg"
+#define WIFI_NVS_SSID_KEY   "ssid"
+#define WIFI_NVS_PASS_KEY   "pass"
+
 static bool wifi_ready = false;
 static int retry_count = 0;
+static char active_ssid[APP_WIFI_SSID_MAX_LEN];
+
+static bool app_wifi_load_credentials(char *ssid, size_t ssid_size, char *password, size_t password_size)
+{
+    if (ssid == NULL || password == NULL || ssid_size == 0 || password_size == 0) {
+        return false;
+    }
+
+    ssid[0] = '\0';
+    password[0] = '\0';
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &handle);
+
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    size_t ssid_len = ssid_size;
+    err = nvs_get_str(handle, WIFI_NVS_SSID_KEY, ssid, &ssid_len);
+
+    if (err != ESP_OK || ssid[0] == '\0') {
+        nvs_close(handle);
+        return false;
+    }
+
+    size_t pass_len = password_size;
+    err = nvs_get_str(handle, WIFI_NVS_PASS_KEY, password, &pass_len);
+
+    if (err != ESP_OK) {
+        password[0] = '\0';
+    }
+
+    nvs_close(handle);
+    return true;
+}
+
+static bool app_wifi_save_credentials(const char *ssid, const char *password)
+{
+    if (ssid == NULL || strlen(ssid) == 0 || strlen(ssid) >= 33) {
+        return false;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open Wi-Fi NVS namespace");
+        return false;
+    }
+
+    bool ok = true;
+
+    ok &= (nvs_set_str(handle, WIFI_NVS_SSID_KEY, ssid) == ESP_OK);
+    ok &= (nvs_set_str(handle, WIFI_NVS_PASS_KEY, password != NULL ? password : "") == ESP_OK);
+
+    if (ok) {
+        ok = (nvs_commit(handle) == ESP_OK);
+    }
+
+    nvs_close(handle);
+
+    if (!ok) {
+        ESP_LOGE(TAG, "Failed to save Wi-Fi credentials");
+    }
+
+    return ok;
+}
 
 static esp_err_t app_wifi_event_handler(void *ctx, system_event_t *event)
 {
@@ -2994,19 +4419,38 @@ void app_wifi_init(void)
     wifi_config_t wifi_config;
     memset(&wifi_config, 0, sizeof(wifi_config));
 
-    strncpy((char *)wifi_config.sta.ssid, APP_WIFI_STA_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, APP_WIFI_STA_PASSWORD, sizeof(wifi_config.sta.password) - 1);
+    char saved_ssid[APP_WIFI_SSID_MAX_LEN];
+    char saved_password[64];
+
+    if (app_wifi_load_credentials(saved_ssid, sizeof(saved_ssid), saved_password, sizeof(saved_password))) {
+        strncpy((char *)wifi_config.sta.ssid, saved_ssid, sizeof(wifi_config.sta.ssid) - 1);
+        strncpy((char *)wifi_config.sta.password, saved_password, sizeof(wifi_config.sta.password) - 1);
+        strncpy(active_ssid, saved_ssid, sizeof(active_ssid) - 1);
+        active_ssid[sizeof(active_ssid) - 1] = '\0';
+        ESP_LOGI(TAG, "Loaded saved Wi-Fi SSID: %s", active_ssid);
+    } else {
+        strncpy((char *)wifi_config.sta.ssid, APP_WIFI_STA_SSID, sizeof(wifi_config.sta.ssid) - 1);
+        strncpy((char *)wifi_config.sta.password, APP_WIFI_STA_PASSWORD, sizeof(wifi_config.sta.password) - 1);
+        strncpy(active_ssid, APP_WIFI_STA_SSID, sizeof(active_ssid) - 1);
+        active_ssid[sizeof(active_ssid) - 1] = '\0';
+        ESP_LOGI(TAG, "Using default Wi-Fi SSID: %s", active_ssid);
+    }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Connecting to Wi-Fi SSID: %s", APP_WIFI_STA_SSID);
+    ESP_LOGI(TAG, "Connecting to Wi-Fi SSID: %s", active_ssid);
 }
 
 bool app_wifi_is_ready(void)
 {
     return wifi_ready;
+}
+
+const char *app_wifi_get_active_ssid(void)
+{
+    return active_ssid;
 }
 
 bool app_wifi_scan(app_wifi_scan_result_t *out_results, int *out_count)
@@ -3021,11 +4465,6 @@ bool app_wifi_scan(app_wifi_scan_result_t *out_results, int *out_count)
     memset(&scan_config, 0, sizeof(scan_config));
     scan_config.show_hidden = false;
 
-    /*
-     * Blocking scan: simplest to reason about for a request/response HTTP
-     * handler. Scanning briefly interrupts the station's normal traffic,
-     * which is an acceptable tradeoff for a manual "scan networks" action.
-     */
     esp_err_t err = esp_wifi_scan_start(&scan_config, true);
 
     if (err != ESP_OK) {
@@ -3071,6 +4510,10 @@ bool app_wifi_connect(const char *ssid, const char *password)
         return false;
     }
 
+    if (!app_wifi_save_credentials(ssid, password)) {
+        return false;
+    }
+
     wifi_config_t wifi_config;
     memset(&wifi_config, 0, sizeof(wifi_config));
 
@@ -3079,6 +4522,9 @@ bool app_wifi_connect(const char *ssid, const char *password)
     if (password != NULL) {
         strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
     }
+
+    strncpy(active_ssid, ssid, sizeof(active_ssid) - 1);
+    active_ssid[sizeof(active_ssid) - 1] = '\0';
 
     wifi_ready = false;
     retry_count = 0;
@@ -3100,11 +4546,10 @@ bool app_wifi_connect(const char *ssid, const char *password)
         return false;
     }
 
-    ESP_LOGI(TAG, "Connecting to new Wi-Fi SSID: %s", ssid);
+    ESP_LOGI(TAG, "Connecting to saved Wi-Fi SSID: %s", ssid);
 
     return true;
 }
-
 
 
 
@@ -3112,8 +4557,7 @@ bool app_wifi_connect(const char *ssid, const char *password)
 COMPONENT_SRCDIRS := .
 COMPONENT_ADD_INCLUDEDIRS := include
 
-COMPONENT_REQUIRES := app_config
-
+COMPONENT_REQUIRES := app_config nvs_flash
 
 
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\components\app_wifi\include\app_wifi.h =====
@@ -3136,29 +4580,25 @@ void app_wifi_init(void);
 
 bool app_wifi_is_ready(void);
 
-/*
- * Scans for nearby networks (blocking). Writes up to
- * APP_WIFI_SCAN_MAX_RESULTS into out_results and the actual count into
- * out_count. Returns false if the scan itself failed to start/complete.
- */
+const char *app_wifi_get_active_ssid(void);
+
 bool app_wifi_scan(app_wifi_scan_result_t *out_results, int *out_count);
 
 /*
- * Reconfigures the station with new credentials and (re)connects.
- * This does not block waiting for the connection result; call
- * app_wifi_is_ready() afterward to check connection status.
+ * Saves the selected credentials into NVS, reconnects immediately,
+ * and uses the same network again after reboot.
  */
 bool app_wifi_connect(const char *ssid, const char *password);
 
 #endif
 
 
+
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\main\component.mk =====
 COMPONENT_SRCDIRS := .
 COMPONENT_ADD_INCLUDEDIRS := .
 
-COMPONENT_REQUIRES := app_wifi app_webserver app_sensors app_system app_outputs app_config nvs_flash
-
+COMPONENT_REQUIRES := app_wifi app_webserver app_sensors app_system app_outputs app_logs app_config nvs_flash
 
 
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\main\main.c =====
@@ -3174,6 +4614,7 @@ COMPONENT_REQUIRES := app_wifi app_webserver app_sensors app_system app_outputs 
 #include "app_system.h"
 #include "app_outputs.h"
 #include "app_config.h"
+#include "app_logs.h"
 
 static const char *TAG = "MAIN";
 
@@ -3197,6 +4638,7 @@ void app_main(void)
 
     app_wifi_init();
     app_webserver_init();
+    app_logs_init();
 
     while (1) {
         app_sensor_data_t sensor_data;
@@ -3225,6 +4667,7 @@ void app_main(void)
         const app_system_state_t *state = app_system_get_state();
 
         app_outputs_update(state);
+        app_logs_append_state(state);
 
         ESP_LOGI(
             TAG,
@@ -3244,6 +4687,8 @@ void app_main(void)
 }
 
 
+
+
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\spiffs\app.js =====
 const pages = document.querySelectorAll(".page");
 const navButtons = document.querySelectorAll(".nav-btn");
@@ -3252,6 +4697,7 @@ const pageTitle = document.getElementById("pageTitle");
 let lastStatus = null;
 let isAuthenticated = false;
 let currentUser = null;
+let serverLogsLoaded = false;
 
 function byId(id) {
   return document.getElementById(id);
@@ -3493,8 +4939,8 @@ function setAuthMode(mode) {
 
   authTitle.textContent = isLogin ? "Log In" : "Create Account";
   authSubtitle.textContent = isLogin
-    ? "Access your helmet's safety dashboard."
-    : "Set up a new account to monitor your helmet.";
+    ? "Enter your account details."
+    : "Create an account for this helmet.";
   authSubmitBtn.textContent = isLogin ? "Log In" : "Register";
   authSwitchText.textContent = isLogin ? "Don't have an account?" : "Already have an account?";
   authSwitchBtn.textContent = isLogin ? "Register" : "Log In";
@@ -3557,14 +5003,23 @@ function setLoggedInUi(user) {
   currentUser = user || null;
   const label = currentUser
     ? (currentUser.name || currentUser.email || "Account")
-    : "Log In";
+    : "Account";
 
   if (loginBtnTop) {
     loginBtnTop.innerHTML = '<svg class="icon"><use href="#icon-user" /></svg> ' + label;
   }
 
+  if (logoutBtnTop) {
+    logoutBtnTop.hidden = false;
+  }
+
   if (mobileLoginBtn) {
-    mobileLoginBtn.setAttribute("aria-label", currentUser ? ("Logged in as " + label) : "Log in");
+    mobileLoginBtn.setAttribute("aria-label", "Log out");
+  }
+
+  const usersNavBtn = byId("usersNavBtn");
+  if (usersNavBtn) {
+    usersNavBtn.hidden = !(currentUser && currentUser.is_admin === true);
   }
 }
 
@@ -3575,8 +5030,17 @@ function setLoggedOutUi() {
     loginBtnTop.innerHTML = '<svg class="icon"><use href="#icon-user" /></svg> Log In';
   }
 
+  if (logoutBtnTop) {
+    logoutBtnTop.hidden = true;
+  }
+
   if (mobileLoginBtn) {
     mobileLoginBtn.setAttribute("aria-label", "Log in");
+  }
+
+  const usersNavBtn = byId("usersNavBtn");
+  if (usersNavBtn) {
+    usersNavBtn.hidden = true;
   }
 }
 
@@ -3617,7 +5081,7 @@ function authRequest(path, payload) {
       return response.json()
         .catch(() => null)
         .then(data => {
-          throw new Error(readAuthError(data, "Authentication failed."));
+          throw new Error(readAuthError(data, "Login failed."));
         });
     }
 
@@ -3647,8 +5111,15 @@ async function checkSession() {
     setAppLocked(false);
     loadStatus();
     loadPinConfig();
+    loadOtaStatus();
+    loadServerLogs();
+
+    if (user.is_admin === true) {
+      loadUsers();
+    }
   } catch (err) {
     isAuthenticated = false;
+    serverLogsLoaded = false;
     setLoggedOutUi();
     setAppLocked(true);
     openAuthModal("login");
@@ -3661,6 +5132,7 @@ function logout() {
     credentials: "same-origin"
   }).finally(() => {
     isAuthenticated = false;
+    serverLogsLoaded = false;
     setLoggedOutUi();
     showPage("dashboard");
     setAppLocked(true);
@@ -3694,7 +5166,7 @@ if (authForm) {
         return checkSession();
       })
       .catch(err => {
-        alert(err.message || "Authentication failed.");
+        alert(err.message || "Login failed.");
       })
       .finally(() => {
         authSubmitBtn.disabled = false;
@@ -3703,11 +5175,15 @@ if (authForm) {
   });
 }
 
+function confirmLogout() {
+  if (confirm("Log out now?")) {
+    logout();
+  }
+}
+
 function handleAccountButton() {
   if (isAuthenticated) {
-    if (confirm("Log out of this helmet dashboard?")) {
-      logout();
-    }
+    confirmLogout();
   } else {
     openAuthModal("login");
   }
@@ -3715,6 +5191,9 @@ function handleAccountButton() {
 
 const loginBtnTop = byId("loginBtnTop");
 if (loginBtnTop) loginBtnTop.addEventListener("click", handleAccountButton);
+
+const logoutBtnTop = byId("logoutBtnTop");
+if (logoutBtnTop) logoutBtnTop.addEventListener("click", confirmLogout);
 
 const mobileLoginBtn = byId("mobileLoginBtn");
 if (mobileLoginBtn) mobileLoginBtn.addEventListener("click", handleAccountButton);
@@ -3729,6 +5208,12 @@ const shiftNotes = byId("shiftNotes");
 
 function formatClock(date) {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatEntryTime(entry) {
+  if (entry.timeLabel) return entry.timeLabel;
+  if (entry.time instanceof Date) return formatClock(entry.time);
+  return "--";
 }
 
 function logReading(data) {
@@ -3747,7 +5232,8 @@ function logReading(data) {
     hum,
     heatIndex,
     dist: toNumber(data.distance_cm),
-    buzzer: !!data.alarm_active
+    buzzer: !!data.alarm_active,
+    update_count: data.update_count
   };
 
   sessionLog.unshift(entry);
@@ -3767,7 +5253,7 @@ function renderLogTable() {
   logTableBody.innerHTML = sessionLog
     .map(entry => `
       <tr${entry.buzzer ? ' class="log-row-alarm"' : ""}>
-        <td>${formatClock(entry.time)}</td>
+        <td>${formatEntryTime(entry)}</td>
         <td>${entry.gas}</td>
         <td>${entry.flame}</td>
         <td>${entry.temp.toFixed(1)}</td>
@@ -3778,6 +5264,56 @@ function renderLogTable() {
       </tr>
     `)
     .join("");
+}
+
+
+function logEntryFromServer(item) {
+  const temp = toNumber(item.temperature_c);
+  const hum = toNumber(item.humidity_percent);
+  const heatIndex = getHeatIndex(item, temp, hum);
+  const alarm = !!(item.gas_warning || item.flame_warning || item.heat_index_warning || item.distance_warning);
+
+  return {
+    timeLabel: "#" + (item.update_count || "--"),
+    update_count: item.update_count || 0,
+    gas: toNumber(item.gas_raw),
+    flame: toNumber(item.flame_raw),
+    temp,
+    hum,
+    heatIndex,
+    dist: toNumber(item.distance_cm),
+    buzzer: alarm
+  };
+}
+
+function loadServerLogs() {
+  if (!isAuthenticated || serverLogsLoaded) return;
+
+  apiFetch("/api/logs", { cache: "no-store" })
+    .then(response => response.json())
+    .then(data => {
+      serverLogsLoaded = true;
+
+      if (!data.logs || !Array.isArray(data.logs)) return;
+
+      sessionLog.length = 0;
+
+      data.logs
+        .slice()
+        .reverse()
+        .forEach(item => sessionLog.push(logEntryFromServer(item)));
+
+      if (sessionLog.length > MAX_LOG_ROWS) {
+        sessionLog.length = MAX_LOG_ROWS;
+      }
+
+      renderLogTable();
+    })
+    .catch(err => {
+      if (err.message !== "LOGIN_REQUIRED") {
+        serverLogsLoaded = true;
+      }
+    });
 }
 
 function exportLogCsv() {
@@ -3791,7 +5327,7 @@ function exportLogCsv() {
     .slice()
     .reverse()
     .map(entry => [
-      entry.time.toISOString(),
+      entry.time instanceof Date ? entry.time.toISOString() : (entry.timeLabel || ""),
       entry.gas,
       entry.flame,
       entry.temp.toFixed(1),
@@ -3816,15 +5352,64 @@ function exportLogCsv() {
 
 function clearLog() {
   if (sessionLog.length === 0) return;
-  if (!confirm("Clear all logged readings for this session?")) return;
+  if (!confirm("Clear all logged readings?")) return;
+
   sessionLog.length = 0;
   renderLogTable();
+
+  if (currentUser && currentUser.is_admin === true) {
+    apiFetch("/api/logs/clear", { method: "POST" })
+      .catch(err => {
+        if (err.message !== "LOGIN_REQUIRED") {
+          alert(err.message || "Local table cleared, but device log was not cleared.");
+        }
+      });
+  }
 }
 
 const exportLogBtn = byId("exportLogBtn");
 const clearLogBtn = byId("clearLogBtn");
 if (exportLogBtn) exportLogBtn.addEventListener("click", exportLogCsv);
 if (clearLogBtn) clearLogBtn.addEventListener("click", clearLog);
+
+
+/* ---------- Admin users ---------- */
+const usersTableBody = byId("usersTableBody");
+const reloadUsersBtn = byId("reloadUsersBtn");
+
+function renderUsers(users) {
+  if (!usersTableBody) return;
+
+  if (!users || users.length === 0) {
+    usersTableBody.innerHTML = '<tr><td colspan="3" class="muted">No users found.</td></tr>';
+    return;
+  }
+
+  usersTableBody.innerHTML = users.map(user => `
+    <tr>
+      <td>${user.name || "--"}</td>
+      <td>${user.email || "--"}</td>
+      <td>${user.role || "user"}</td>
+    </tr>
+  `).join("");
+}
+
+function loadUsers() {
+  if (!isAuthenticated || !currentUser || currentUser.is_admin !== true) return;
+
+  apiFetch("/api/auth/users", { cache: "no-store" })
+    .then(response => response.json())
+    .then(data => renderUsers(data.users || []))
+    .catch(err => {
+      if (err.message !== "LOGIN_REQUIRED" && usersTableBody) {
+        usersTableBody.innerHTML = '<tr><td colspan="3" class="muted">Unable to load users.</td></tr>';
+      }
+    });
+}
+
+if (reloadUsersBtn) {
+  reloadUsersBtn.addEventListener("click", loadUsers);
+}
 
 if (shiftNotes) {
   try {
@@ -4025,7 +5610,7 @@ function renderWifiList(networks) {
         <svg class="icon"><use href="#icon-wifi" /></svg>
         <div>
           <strong>${ssid}</strong>
-          <span>RSSI: ${rssi} dBm ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· Security: ${auth}</span>
+          <span>RSSI: ${rssi} dBm â€¢ Security: ${auth}</span>
         </div>
       </div>
       <button class="small-btn">Select</button>
@@ -4120,12 +5705,35 @@ function saveThresholds(event) {
 }
 
 /* ---------- Hardware pin configuration ---------- */
-const ADC_OPTIONS = ["A0", "ADC1", "ADC2", "ADC3", "ADC4", "ADC5", "ADC6", "ADC7"];
-const GPIO_OPTIONS = ["D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "GPIO3", "GPIO1"];
+const ADC_OPTIONS = ["A0"];
 
-const PIN_SELECT_IDS = [
-  "gas_adcPin",
-  "flame_adcPin",
+const DIGITAL_PIN_OPTIONS = [
+  "D0",
+  "D1",
+  "D2",
+  "D3",
+  "D4",
+  "D5",
+  "D6",
+  "D7",
+  "D8"
+];
+
+const PIN_OPTIONS_BY_SELECT = {
+  gas_digitalPin: DIGITAL_PIN_OPTIONS,
+  flame_adcPin: ADC_OPTIONS,
+  dht_dataPin: DIGITAL_PIN_OPTIONS,
+  ultrasonic_trigPin: DIGITAL_PIN_OPTIONS,
+  ultrasonic_echoPin: DIGITAL_PIN_OPTIONS,
+  led_gasPin: DIGITAL_PIN_OPTIONS,
+  led_flamePin: DIGITAL_PIN_OPTIONS,
+  led_heat_indexPin: DIGITAL_PIN_OPTIONS,
+  led_distancePin: DIGITAL_PIN_OPTIONS,
+  buzzerPin: DIGITAL_PIN_OPTIONS
+};
+
+const DIGITAL_PIN_SELECT_IDS = [
+  "gas_digitalPin",
   "dht_dataPin",
   "ultrasonic_trigPin",
   "ultrasonic_echoPin",
@@ -4136,32 +5744,107 @@ const PIN_SELECT_IDS = [
   "buzzerPin"
 ];
 
-function fillSelect(id, options) {
+const PIN_SELECT_IDS = [
+  "gas_digitalPin",
+  "flame_adcPin",
+  ...DIGITAL_PIN_SELECT_IDS.filter(id => id !== "gas_digitalPin")
+];
+
+const DEFAULT_PIN_VALUES = {
+  gas_digitalPin: "D6",
+  flame_adcPin: "A0",
+  dht_dataPin: "D1",
+  ultrasonic_trigPin: "D2",
+  ultrasonic_echoPin: "D5",
+  led_gasPin: "D0",
+  led_flamePin: "D3",
+  led_heat_indexPin: "D4",
+  led_distancePin: "D8",
+  buzzerPin: "D7"
+};
+
+let pinSelectsInitialized = false;
+
+function optionIsAllowedForSelect(id, value) {
+  const allowed = PIN_OPTIONS_BY_SELECT[id] || [];
+  return allowed.includes(value);
+}
+
+function getUsedDigitalPins(exceptId) {
+  const used = new Set();
+
+  DIGITAL_PIN_SELECT_IDS.forEach(id => {
+    if (id === exceptId) return;
+
+    const select = byId(id);
+
+    if (select && select.value) {
+      used.add(select.value);
+    }
+  });
+
+  return used;
+}
+
+function renderPinSelect(id) {
   const select = byId(id);
-  if (!select || select.options.length > 0) return;
+  if (!select) return;
+
+  const current = select.value || DEFAULT_PIN_VALUES[id] || "";
+  const options = PIN_OPTIONS_BY_SELECT[id] || [];
+  const used = DIGITAL_PIN_SELECT_IDS.includes(id) ? getUsedDigitalPins(id) : new Set();
+
+  select.innerHTML = "";
 
   options.forEach(value => {
+    if (used.has(value) && value !== current) {
+      return;
+    }
+
     const option = document.createElement("option");
     option.value = value;
     option.textContent = value;
     select.appendChild(option);
   });
+
+  if (current && optionIsAllowedForSelect(id, current)) {
+    const exists = Array.from(select.options).some(option => option.value === current);
+
+    if (!exists) {
+      const option = document.createElement("option");
+      option.value = current;
+      option.textContent = current;
+      select.appendChild(option);
+    }
+
+    select.value = current;
+  }
+
+  if (!select.value && select.options.length > 0) {
+    select.value = select.options[0].value;
+  }
+}
+
+function updatePinDropdowns() {
+  PIN_SELECT_IDS.forEach(renderPinSelect);
 }
 
 function initPinSelects() {
-  fillSelect("gas_adcPin", ADC_OPTIONS);
-  fillSelect("flame_adcPin", ADC_OPTIONS);
+  updatePinDropdowns();
 
-  [
-    "dht_dataPin",
-    "ultrasonic_trigPin",
-    "ultrasonic_echoPin",
-    "led_gasPin",
-    "led_flamePin",
-    "led_heat_indexPin",
-    "led_distancePin",
-    "buzzerPin"
-  ].forEach(id => fillSelect(id, GPIO_OPTIONS));
+  if (pinSelectsInitialized) {
+    return;
+  }
+
+  PIN_SELECT_IDS.forEach(id => {
+    const select = byId(id);
+
+    if (select) {
+      select.addEventListener("change", updatePinDropdowns);
+    }
+  });
+
+  pinSelectsInitialized = true;
 }
 
 function setPinValue(id, value) {
@@ -4169,6 +5852,11 @@ function setPinValue(id, value) {
   if (!select || value === undefined || value === null) return;
 
   const text = String(value);
+
+  if (!optionIsAllowedForSelect(id, text)) {
+    return;
+  }
+
   const exists = Array.from(select.options).some(option => option.value === text);
 
   if (!exists) {
@@ -4179,6 +5867,24 @@ function setPinValue(id, value) {
   }
 
   select.value = text;
+}
+
+function validateUniqueDigitalPins() {
+  const used = new Map();
+
+  for (const id of DIGITAL_PIN_SELECT_IDS) {
+    const select = byId(id);
+    if (!select) continue;
+
+    if (used.has(select.value)) {
+      alert("Pin " + select.value + " is already used by another function. Choose a different pin.");
+      return false;
+    }
+
+    used.set(select.value, id);
+  }
+
+  return true;
 }
 
 function loadPinConfig() {
@@ -4193,20 +5899,22 @@ function loadPinConfig() {
     .then(data => {
       const pins = data.pins || data;
 
-      setPinValue("gas_adcPin", pins.gas_adc || pins.gas_adc_channel || "A0");
-      setPinValue("flame_adcPin", pins.flame_adc || pins.flame_adc_channel || "ADC1");
+      setPinValue("gas_digitalPin", pins.gas_digital || pins.gas_digital_gpio || "D6");
+      setPinValue("flame_adcPin", pins.flame_adc || pins.flame_adc_channel || "A0");
       setPinValue("dht_dataPin", pins.dht_data || pins.dht_gpio || "D1");
       setPinValue("ultrasonic_trigPin", pins.ultrasonic_trig || pins.ultrasonic_trig_gpio || "D2");
       setPinValue("ultrasonic_echoPin", pins.ultrasonic_echo || pins.ultrasonic_echo_gpio || "D5");
       setPinValue("led_gasPin", pins.led_gas || pins.led_gas_gpio || "D0");
       setPinValue("led_flamePin", pins.led_flame || pins.led_flame_gpio || "D3");
       setPinValue("led_heat_indexPin", pins.led_heat_index || pins.led_heat_index_gpio || "D4");
-      setPinValue("led_distancePin", pins.led_distance || pins.led_distance_gpio || "D6");
+      setPinValue("led_distancePin", pins.led_distance || pins.led_distance_gpio || "D8");
       setPinValue("buzzerPin", pins.buzzer || pins.buzzer_gpio || "D7");
+
+      updatePinDropdowns();
     })
     .catch(err => {
       if (err.message !== "LOGIN_REQUIRED") {
-        /* Pin endpoint is optional for old firmware. Keep defaults visible. */
+        updatePinDropdowns();
       }
     });
 }
@@ -4214,8 +5922,12 @@ function loadPinConfig() {
 function savePinConfig(event) {
   event.preventDefault();
 
+  if (!validateUniqueDigitalPins()) {
+    return;
+  }
+
   const config = {
-    gas_adc: byId("gas_adcPin").value,
+    gas_digital: byId("gas_digitalPin").value,
     flame_adc: byId("flame_adcPin").value,
     dht_data: byId("dht_dataPin").value,
     ultrasonic_trig: byId("ultrasonic_trigPin").value,
@@ -4233,7 +5945,7 @@ function savePinConfig(event) {
     body: JSON.stringify(config)
   })
     .then(() => {
-      alert("Pin configuration saved.");
+      alert("Pin configuration saved and applied.");
     })
     .catch(err => {
       if (err.message !== "LOGIN_REQUIRED") {
@@ -4242,6 +5954,125 @@ function savePinConfig(event) {
     });
 }
 
+
+
+/* ---------- OTA updates ---------- */
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+
+  if (!bytes) return "--";
+  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return bytes + " B";
+}
+
+function loadOtaStatus() {
+  if (!isAuthenticated || !byId("otaRunningPartition")) {
+    return;
+  }
+
+  apiFetch("/api/ota/status", { cache: "no-store" })
+    .then(response => response.json())
+    .then(data => {
+      setText("otaRunningPartition", data.running_partition || "--");
+      setText("otaNextPartition", data.next_update_partition || "--");
+      setText("otaSlotSize", formatBytes(data.next_update_size));
+      setText("otaSpiffsSize", formatBytes(data.storage_size));
+    })
+    .catch(err => {
+      if (err.message !== "LOGIN_REQUIRED") {
+        setText("otaRunningPartition", "Endpoint missing");
+        setText("otaNextPartition", "--");
+        setText("otaSlotSize", "--");
+        setText("otaSpiffsSize", "--");
+      }
+    });
+}
+
+function setUploadProgress(progressId, percentValue) {
+  const bar = byId(progressId);
+  if (!bar) return;
+  bar.style.width = Math.max(0, Math.min(100, percentValue)) + "%";
+}
+
+function setUploadStatus(statusId, text, isError) {
+  const el = byId(statusId);
+  if (!el) return;
+  el.textContent = text;
+  el.className = isError ? "upload-status state warn" : "upload-status muted";
+}
+
+function uploadBinaryFile(options) {
+  const fileInput = byId(options.fileInputId);
+  const button = byId(options.buttonId);
+  const file = fileInput && fileInput.files && fileInput.files[0];
+
+  if (!file) {
+    setUploadStatus(options.statusId, "Choose a .bin file first.", true);
+    return;
+  }
+
+  if (!file.name.toLowerCase().endsWith(".bin")) {
+    setUploadStatus(options.statusId, "Use a .bin file only.", true);
+    return;
+  }
+
+  if (!confirm(options.confirmText + "\n\nFile: " + file.name + "\nSize: " + formatBytes(file.size))) {
+    return;
+  }
+
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", options.endpoint, true);
+  xhr.withCredentials = true;
+  xhr.setRequestHeader("Content-Type", "application/octet-stream");
+
+  setUploadProgress(options.progressId, 0);
+  setUploadStatus(options.statusId, "Uploading " + file.name + "...", false);
+  if (button) button.disabled = true;
+
+  xhr.upload.onprogress = function (event) {
+    if (event.lengthComputable) {
+      setUploadProgress(options.progressId, (event.loaded / event.total) * 100);
+    }
+  };
+
+  xhr.onload = function () {
+    if (button) button.disabled = false;
+
+    let data = null;
+    try {
+      data = JSON.parse(xhr.responseText || "{}");
+    } catch (err) {
+      data = null;
+    }
+
+    if (xhr.status === 401) {
+      showLoginRequired();
+      setUploadStatus(options.statusId, "Login required.", true);
+      return;
+    }
+
+    if (xhr.status < 200 || xhr.status >= 300) {
+      const message = data && data.error ? data.error : "Upload failed.";
+      setUploadStatus(options.statusId, message, true);
+      return;
+    }
+
+    setUploadProgress(options.progressId, 100);
+    setUploadStatus(options.statusId, (data && data.message) ? data.message : "Upload complete. Device is rebooting.", false);
+
+    setTimeout(() => {
+      loadOtaStatus();
+    }, 4000);
+  };
+
+  xhr.onerror = function () {
+    if (button) button.disabled = false;
+    setUploadStatus(options.statusId, "Network error during upload.", true);
+  };
+
+  xhr.send(file);
+}
 
 function postAction(url, missingMessage) {
   apiFetch(url, { method: "POST" })
@@ -4264,14 +6095,45 @@ if (pinConfigForm) pinConfigForm.addEventListener("submit", savePinConfig);
 initPinSelects();
 
 byId("testAlarmBtn").addEventListener("click", () => {
-  postAction("/api/alarm/test", "Firmware endpoint POST /api/alarm/test isn't ready yet.");
+  postAction("/api/alarm/test", "Alarm test failed.");
 });
 
 byId("restartBtn").addEventListener("click", () => {
   if (confirm("Restart ESP8266 device?")) {
-    postAction("/api/system/restart", "Firmware endpoint POST /api/system/restart isn't ready yet.");
+    postAction("/api/system/restart", "Restart failed.");
   }
 });
+
+const refreshOtaStatusBtn = byId("refreshOtaStatusBtn");
+if (refreshOtaStatusBtn) refreshOtaStatusBtn.addEventListener("click", loadOtaStatus);
+
+const firmwareOtaBtn = byId("firmwareOtaBtn");
+if (firmwareOtaBtn) {
+  firmwareOtaBtn.addEventListener("click", () => {
+    uploadBinaryFile({
+      endpoint: "/api/ota/firmware",
+      fileInputId: "firmwareOtaFile",
+      progressId: "firmwareOtaProgress",
+      statusId: "firmwareOtaStatus",
+      buttonId: "firmwareOtaBtn",
+      confirmText: "Upload firmware OTA? The device will reboot after success."
+    });
+  });
+}
+
+const spiffsOtaBtn = byId("spiffsOtaBtn");
+if (spiffsOtaBtn) {
+  spiffsOtaBtn.addEventListener("click", () => {
+    uploadBinaryFile({
+      endpoint: "/api/ota/spiffs",
+      fileInputId: "spiffsOtaFile",
+      progressId: "spiffsOtaProgress",
+      statusId: "spiffsOtaStatus",
+      buttonId: "spiffsOtaBtn",
+      confirmText: "Upload SPIFFS/UI OTA? The web files will be replaced and the device will reboot after success."
+    });
+  });
+}
 
 checkSession();
 setInterval(() => {
@@ -4279,6 +6141,12 @@ setInterval(() => {
     loadStatus();
   }
 }, 1000);
+
+
+
+
+
+
 
 
 ===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\spiffs\index.html =====
@@ -4292,7 +6160,6 @@ setInterval(() => {
 </head>
 <body class="auth-locked">
 
-  <!-- Icon sprite: every icon in the UI is referenced from here via <use> -->
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
     <defs>
       <symbol id="icon-helmet" viewBox="0 0 24 24">
@@ -4425,7 +6292,6 @@ setInterval(() => {
   </svg>
 
   <div class="app-shell">
-    <!-- Mobile top bar: hamburger + brand mark, visible only on small screens -->
     <header class="mobile-topbar">
       <button id="mobileMenuBtn" class="icon-btn" type="button" aria-label="Open menu" aria-expanded="false">
         <svg class="icon"><use href="#icon-menu" /></svg>
@@ -4439,7 +6305,6 @@ setInterval(() => {
       </button>
     </header>
 
-    <!-- Dimmed backdrop shown behind the sidebar when it's open on mobile -->
     <div id="mobileNavOverlay" class="mobile-nav-overlay"></div>
 
     <aside class="sidebar" id="sidebar">
@@ -4468,6 +6333,10 @@ setInterval(() => {
         <button class="nav-btn" data-page="logs">
           <svg class="icon"><use href="#icon-note" /></svg> Logs &amp; Notes
         </button>
+
+        <button id="usersNavBtn" class="nav-btn admin-only" data-page="users" hidden>
+          <svg class="icon"><use href="#icon-user" /></svg> Users
+        </button>
         <p class="nav-label" style="margin-top:14px;">Configure</p>
         <button class="nav-btn" data-page="wifi">
           <svg class="icon"><use href="#icon-wifi" /></svg> Wi-Fi Setup
@@ -4477,6 +6346,9 @@ setInterval(() => {
         </button>
         <button class="nav-btn" data-page="device">
           <svg class="icon"><use href="#icon-cpu" /></svg> Device
+        </button>
+        <button class="nav-btn" data-page="ota">
+          <svg class="icon"><use href="#icon-download" /></svg> OTA Updates
         </button>
       </nav>
 
@@ -4494,14 +6366,17 @@ setInterval(() => {
     <main class="main">
       <header class="topbar">
         <div>
-          <p class="eyebrow">Embedded Safety System</p>
+          <p class="eyebrow">Helmet Safety</p>
           <h2 id="pageTitle">Dashboard</h2>
         </div>
 
         <div class="top-actions">
           <span id="systemBadge" class="badge neutral">Connecting...</span>
-          <button id="loginBtnTop" class="small-btn auth-btn-top">
+          <button id="loginBtnTop" class="small-btn auth-btn-top" type="button">
             <svg class="icon"><use href="#icon-user" /></svg> Log In
+          </button>
+          <button id="logoutBtnTop" class="small-btn danger-soft-btn" type="button" hidden>
+            Log Out
           </button>
         </div>
       </header>
@@ -4513,7 +6388,7 @@ setInterval(() => {
             <div class="hero-text">
               <p class="eyebrow">Safety State</p>
               <h3 id="dangerTitle">Waiting for data</h3>
-              <p id="dangerText">The dashboard is waiting for the first reading from the helmet.</p>
+              <p id="dangerText">Waiting for helmet data.</p>
             </div>
             <div class="gauge">
               <svg viewBox="0 0 96 96">
@@ -4556,7 +6431,7 @@ setInterval(() => {
               <span class="sensor-icon"><svg class="icon"><use href="#icon-flask" /></svg></span>
               <div>
                 <h3>Gas Level</h3>
-                <p>MQ sensor raw reading</p>
+                <p>MQ135 digital DO</p>
               </div>
             </div>
             <div class="reading"><span id="gasValue">--</span><small>raw</small></div>
@@ -4569,7 +6444,7 @@ setInterval(() => {
               <span class="sensor-icon danger-icon"><svg class="icon"><use href="#icon-flame" /></svg></span>
               <div>
                 <h3>Flame Sensor</h3>
-                <p>Flame module raw reading</p>
+                <p>Analog A0 reading</p>
               </div>
             </div>
             <div class="reading"><span id="flameValue">--</span><small>raw</small></div>
@@ -4582,7 +6457,7 @@ setInterval(() => {
               <span class="sensor-icon"><svg class="icon"><use href="#icon-thermometer" /></svg></span>
               <div>
                 <h3>DHT Temperature &amp; Humidity</h3>
-                <p>One DHT sensor gives temperature and humidity. Heat index is computed from both values.</p>
+                <p>Temperature, humidity, and heat index.</p>
               </div>
             </div>
 
@@ -4612,7 +6487,7 @@ setInterval(() => {
               <span class="sensor-icon"><svg class="icon"><use href="#icon-radar" /></svg></span>
               <div>
                 <h3>Distance</h3>
-                <p>Nearest obstacle ahead</p>
+                <p>Obstacle distance</p>
               </div>
             </div>
             <div class="reading"><span id="distValue">--</span><small>cm</small></div>
@@ -4625,7 +6500,7 @@ setInterval(() => {
       <section id="sensors" class="page">
         <div class="panel">
           <h3>Live Sensor Details</h3>
-          <p class="muted">Full raw status as reported by the ESP8266, updated every second.</p>
+          <p class="muted">Live values from the helmet.</p>
 
           <div class="table-wrap">
             <table>
@@ -4657,7 +6532,7 @@ setInterval(() => {
           <div class="section-head">
             <div>
               <h3>Reading History</h3>
-              <p class="muted">Every reading received in this browser session, newest first. Export it any time as CSV.</p>
+              <p class="muted">Newest readings in this browser.</p>
             </div>
             <div class="logs-actions">
               <button id="exportLogBtn" class="small-btn">
@@ -4690,8 +6565,36 @@ setInterval(() => {
 
         <div class="panel">
           <h3>Shift Notes</h3>
-          <p class="muted">Jot down anything worth remembering about this session Ã¢â‚¬â€ saved only in this browser tab.</p>
+          <p class="muted">Session notes saved in this browser tab.</p>
           <textarea id="shiftNotes" class="notes-area" placeholder="e.g. Checked helmet seal before descent, gas baseline reads a bit high near the east shaft..."></textarea>
+        </div>
+      </section>
+
+      <section id="users" class="page">
+        <div class="panel">
+          <div class="section-head">
+            <div>
+              <h3>Users</h3>
+              <p class="muted">Registered local accounts.</p>
+            </div>
+
+            <button id="reloadUsersBtn" class="small-btn">Reload Users</button>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Username</th>
+                  <th>Role</th>
+                </tr>
+              </thead>
+              <tbody id="usersTableBody">
+                <tr><td colspan="3" class="muted">Log in as admin to see users.</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </section>
 
@@ -4700,15 +6603,9 @@ setInterval(() => {
           <div class="section-head">
             <div>
               <h3>Wi-Fi Setup</h3>
-              <p class="muted">Scan nearby networks and connect the helmet to one of them.</p>
+              <p class="muted">Connect the helmet to Wi-Fi.</p>
             </div>
             <button id="scanWifiBtn" class="primary-btn">Scan Networks</button>
-          </div>
-
-          <div id="wifiApiNotice" class="notice">
-            <svg class="icon"><use href="#icon-info" /></svg>
-            <span>Network scanning needs a firmware endpoint: <strong>GET /api/wifi/scan</strong>.
-            The current firmware only exposes <strong>/api/status</strong>.</span>
           </div>
 
           <div id="wifiList" class="wifi-list"></div>
@@ -4728,34 +6625,16 @@ setInterval(() => {
           </form>
         </div>
 
-        <div class="panel">
-          <h3>Known Network Strategy</h3>
-          <p class="muted">
-            How the firmware should choose a network: scan, compare against saved credentials,
-            then connect to the strongest match.
-          </p>
-
-          <div class="logic-box">
-            <p>1. Browser requests a Wi-Fi scan.</p>
-            <p>2. ESP8266 runs <code>esp_wifi_scan_start()</code>.</p>
-            <p>3. Firmware compares scanned SSIDs against saved credentials.</p>
-            <p>4. The strongest matching network is selected by RSSI.</p>
-            <p>5. Firmware calls <code>esp_wifi_set_config()</code> then <code>esp_wifi_connect()</code>.</p>
-          </div>
-        </div>
       </section>
 
       <section id="thresholds" class="page">
         <div class="panel">
           <h3>Danger Thresholds</h3>
-          <p class="muted">
-            These limits decide when a sensor reading counts as a warning. They should be saved
-            to NVS or SPIFFS so they survive a restart, not hardcoded in app_config.h.
-          </p>
+          <p class="muted">Set warning limits.</p>
 
           <form id="thresholdForm" class="form-grid two">
             <label>
-              Gas Warning Level
+              Gas Digital Warning Level
               <input id="gasLimit" type="number" min="0" max="1023" value="600" />
             </label>
 
@@ -4777,10 +6656,6 @@ setInterval(() => {
             <button type="submit" class="primary-btn">Save Thresholds</button>
           </form>
 
-          <div class="notice">
-            <svg class="icon"><use href="#icon-info" /></svg>
-            <span>This UI sends gas, flame, computed heat index, and distance limits to <strong>POST /api/config/thresholds</strong>.</span>
-          </div>
         </div>
       </section>
 
@@ -4800,7 +6675,7 @@ setInterval(() => {
 
         <div class="panel">
           <h3>Live Outputs</h3>
-          <p class="muted">Alarm is the buzzer sound. There is no separate alarm LED in this UI.</p>
+          <p class="muted">Buzzer alarm state.</p>
 
           <div class="output-grid">
             <div><span>Gas LED</span><strong id="ledGasState" class="state offline">--</strong></div>
@@ -4813,16 +6688,16 @@ setInterval(() => {
 
         <div class="panel">
           <h3>Hardware Pins</h3>
-          <p class="muted">Configure sensors, warning LEDs, and the buzzer. Save, then restart if your firmware requires restart to apply pins.</p>
+          <p class="muted">Pin mapping.</p>
 
           <form id="pinConfigForm" class="form-grid two">
             <label>
-              Gas Analog
-              <select id="gas_adcPin"></select>
+              MQ135 Gas Digital DO
+              <select id="gas_digitalPin"></select>
             </label>
 
             <label>
-              Flame Analog
+              Flame Analog AO
               <select id="flame_adcPin"></select>
             </label>
 
@@ -4869,31 +6744,74 @@ setInterval(() => {
             <button type="submit" class="primary-btn">Save Pin Configuration</button>
           </form>
 
-          <div class="notice">
-            <svg class="icon"><use href="#icon-info" /></svg>
-            <span>ESP8266 has only one internal analog input, A0. If gas and flame are both analog, use an external ADC or multiplexer.</span>
-          </div>
         </div>
 
         <div class="panel">
           <h3>System Actions</h3>
-          <p class="muted">Use these to test the buzzer alarm and restart the ESP8266.</p>
+          <p class="muted">Test the alarm or restart the device.</p>
 
           <div class="action-row">
             <button id="testAlarmBtn" class="secondary-btn">Test Alarm</button>
             <button id="restartBtn" class="danger-btn">Restart Device</button>
           </div>
 
-          <div class="notice">
-            <svg class="icon"><use href="#icon-info" /></svg>
-            <span>These actions call <strong>POST /api/alarm/test</strong> and <strong>POST /api/system/restart</strong>.</span>
+        </div>
+      </section>
+
+      <section id="ota" class="page">
+        <div class="panel">
+          <div class="section-head">
+            <div>
+              <h3>OTA Updates</h3>
+              <p class="muted">Upload firmware or UI image.</p>
+            </div>
+            <button id="refreshOtaStatusBtn" class="small-btn">Refresh OTA Status</button>
+          </div>
+
+          <div class="ota-status-grid">
+            <div><span>Running App</span><strong id="otaRunningPartition">--</strong></div>
+            <div><span>Next OTA Slot</span><strong id="otaNextPartition">--</strong></div>
+            <div><span>OTA Slot Size</span><strong id="otaSlotSize">--</strong></div>
+            <div><span>SPIFFS Size</span><strong id="otaSpiffsSize">--</strong></div>
+          </div>
+</div>
+
+        <div class="ota-grid">
+          <div class="panel ota-card">
+            <h3>Firmware OTA</h3>
+            <p class="muted">Updates device firmware.</p>
+
+            <label class="file-picker">
+              Application .bin
+              <input id="firmwareOtaFile" type="file" accept=".bin,application/octet-stream" />
+            </label>
+
+            <div class="progress-track"><div id="firmwareOtaProgress" class="progress-fill"></div></div>
+            <p id="firmwareOtaStatus" class="upload-status muted">No firmware file selected.</p>
+
+            <button id="firmwareOtaBtn" class="primary-btn">Upload Firmware OTA</button>
+          </div>
+
+          <div class="panel ota-card">
+            <h3>SPIFFS / UI OTA</h3>
+            <p class="muted">Updates web interface files.</p>
+
+            <label class="file-picker">
+              SPIFFS image .bin
+              <input id="spiffsOtaFile" type="file" accept=".bin,application/octet-stream" />
+            </label>
+
+            <div class="progress-track"><div id="spiffsOtaProgress" class="progress-fill"></div></div>
+            <p id="spiffsOtaStatus" class="upload-status muted">No SPIFFS image selected.</p>
+
+            <button id="spiffsOtaBtn" class="primary-btn">Upload UI / SPIFFS OTA</button>
           </div>
         </div>
+
       </section>
     </main>
   </div>
 
-  <!-- Login / Register modal: dashboard stays locked until session is valid -->
   <div id="authModal" class="modal-overlay">
     <div class="modal-card">
       <button id="authCloseBtn" class="icon-btn modal-close" type="button" aria-label="Close">
@@ -4905,7 +6823,7 @@ setInterval(() => {
       </div>
 
       <h3 id="authTitle">Log In</h3>
-      <p id="authSubtitle" class="muted">Access your helmet's safety dashboard.</p>
+      <p id="authSubtitle" class="muted">Enter your account details.</p>
 
       <form id="authForm" class="form-grid one">
         <label id="authNameField" style="display:none;">
@@ -4914,8 +6832,8 @@ setInterval(() => {
         </label>
 
         <label>
-          Email
-          <input id="authEmail" type="email" placeholder="you@example.com" autocomplete="email" required />
+          Username or Email
+          <input id="authEmail" type="text" placeholder="admin or user@example.com" autocomplete="username" required />
         </label>
 
         <label>
@@ -4938,11 +6856,13 @@ setInterval(() => {
 </html>
 
 
-===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\spiffs\style.css =====
-/* style.css Ã¢â‚¬â€ Underground Helmet Safety Monitor
-   Design system: concrete/graphite surfaces, safety-amber accent,
-   hazard-stripe signature, condensed industrial type. */
 
+
+
+
+
+
+===== C:\darho\esp8266-rtos\academy\projects\underground-helmet\spiffs\style.css =====
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
 
 * {
@@ -5410,6 +7330,21 @@ svg.icon {
 
 .auth-btn-top {
   display: inline-flex;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.danger-soft-btn {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: transparent;
+}
+
+.danger-soft-btn:hover {
+  background: var(--danger);
+  color: #fff;
 }
 
 .badge {
@@ -6568,4 +8503,94 @@ body.auth-locked .modal-close {
     grid-template-columns: 1fr;
   }
 }
+
+
+/* ---------- OTA update page ---------- */
+.ota-status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.ota-status-grid div {
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 14px;
+  background: var(--panel-soft);
+}
+
+.ota-status-grid span {
+  display: block;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.ota-status-grid strong {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  color: var(--text-primary);
+}
+
+.ota-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.ota-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.file-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.file-picker input[type="file"] {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px;
+  background: var(--input-bg);
+  color: var(--text-primary);
+}
+
+.progress-track {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--meter-bg);
+  border: 1px solid var(--border);
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.upload-status {
+  min-height: 20px;
+}
+
+.warning-notice {
+  margin-top: 16px;
+}
+
+@media (max-width: 900px) {
+  .ota-status-grid,
+  .ota-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 

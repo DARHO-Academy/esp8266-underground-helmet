@@ -70,7 +70,8 @@ app_wifi.o: \
  C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/lwip/include/apps/dhcpserver/dhcpserver.h \
  C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/esp_event/include/esp_event_loop.h \
  C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/log/include/esp_log.h \
- C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/log/include/esp_log_internal.h
+ C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/log/include/esp_log_internal.h \
+ C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/nvs_flash/include/nvs.h
 
 C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_wifi/include/app_wifi.h:
 
@@ -213,4 +214,6 @@ C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/esp_event/include/esp_event_lo
 C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/log/include/esp_log.h:
 
 C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/log/include/esp_log_internal.h:
+
+C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/nvs_flash/include/nvs.h:
 /c/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_wifi/./app_wifi.c:

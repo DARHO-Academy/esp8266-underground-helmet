@@ -5,6 +5,7 @@ const pageTitle = document.getElementById("pageTitle");
 let lastStatus = null;
 let isAuthenticated = false;
 let currentUser = null;
+let serverLogsLoaded = false;
 
 function byId(id) {
   return document.getElementById(id);
@@ -246,8 +247,8 @@ function setAuthMode(mode) {
 
   authTitle.textContent = isLogin ? "Log In" : "Create Account";
   authSubtitle.textContent = isLogin
-    ? "Access your helmet's safety dashboard."
-    : "Set up a new account to monitor your helmet.";
+    ? "Enter your account details."
+    : "Create an account for this helmet.";
   authSubmitBtn.textContent = isLogin ? "Log In" : "Register";
   authSwitchText.textContent = isLogin ? "Don't have an account?" : "Already have an account?";
   authSwitchBtn.textContent = isLogin ? "Register" : "Log In";
@@ -310,14 +311,23 @@ function setLoggedInUi(user) {
   currentUser = user || null;
   const label = currentUser
     ? (currentUser.name || currentUser.email || "Account")
-    : "Log In";
+    : "Account";
 
   if (loginBtnTop) {
     loginBtnTop.innerHTML = '<svg class="icon"><use href="#icon-user" /></svg> ' + label;
   }
 
+  if (logoutBtnTop) {
+    logoutBtnTop.hidden = false;
+  }
+
   if (mobileLoginBtn) {
-    mobileLoginBtn.setAttribute("aria-label", currentUser ? ("Logged in as " + label) : "Log in");
+    mobileLoginBtn.setAttribute("aria-label", "Log out");
+  }
+
+  const usersNavBtn = byId("usersNavBtn");
+  if (usersNavBtn) {
+    usersNavBtn.hidden = !(currentUser && currentUser.is_admin === true);
   }
 }
 
@@ -328,8 +338,17 @@ function setLoggedOutUi() {
     loginBtnTop.innerHTML = '<svg class="icon"><use href="#icon-user" /></svg> Log In';
   }
 
+  if (logoutBtnTop) {
+    logoutBtnTop.hidden = true;
+  }
+
   if (mobileLoginBtn) {
     mobileLoginBtn.setAttribute("aria-label", "Log in");
+  }
+
+  const usersNavBtn = byId("usersNavBtn");
+  if (usersNavBtn) {
+    usersNavBtn.hidden = true;
   }
 }
 
@@ -370,7 +389,7 @@ function authRequest(path, payload) {
       return response.json()
         .catch(() => null)
         .then(data => {
-          throw new Error(readAuthError(data, "Authentication failed."));
+          throw new Error(readAuthError(data, "Login failed."));
         });
     }
 
@@ -401,8 +420,14 @@ async function checkSession() {
     loadStatus();
     loadPinConfig();
     loadOtaStatus();
+    loadServerLogs();
+
+    if (user.is_admin === true) {
+      loadUsers();
+    }
   } catch (err) {
     isAuthenticated = false;
+    serverLogsLoaded = false;
     setLoggedOutUi();
     setAppLocked(true);
     openAuthModal("login");
@@ -415,6 +440,7 @@ function logout() {
     credentials: "same-origin"
   }).finally(() => {
     isAuthenticated = false;
+    serverLogsLoaded = false;
     setLoggedOutUi();
     showPage("dashboard");
     setAppLocked(true);
@@ -448,7 +474,7 @@ if (authForm) {
         return checkSession();
       })
       .catch(err => {
-        alert(err.message || "Authentication failed.");
+        alert(err.message || "Login failed.");
       })
       .finally(() => {
         authSubmitBtn.disabled = false;
@@ -457,11 +483,15 @@ if (authForm) {
   });
 }
 
+function confirmLogout() {
+  if (confirm("Log out now?")) {
+    logout();
+  }
+}
+
 function handleAccountButton() {
   if (isAuthenticated) {
-    if (confirm("Log out of this helmet dashboard?")) {
-      logout();
-    }
+    confirmLogout();
   } else {
     openAuthModal("login");
   }
@@ -469,6 +499,9 @@ function handleAccountButton() {
 
 const loginBtnTop = byId("loginBtnTop");
 if (loginBtnTop) loginBtnTop.addEventListener("click", handleAccountButton);
+
+const logoutBtnTop = byId("logoutBtnTop");
+if (logoutBtnTop) logoutBtnTop.addEventListener("click", confirmLogout);
 
 const mobileLoginBtn = byId("mobileLoginBtn");
 if (mobileLoginBtn) mobileLoginBtn.addEventListener("click", handleAccountButton);
@@ -483,6 +516,12 @@ const shiftNotes = byId("shiftNotes");
 
 function formatClock(date) {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatEntryTime(entry) {
+  if (entry.timeLabel) return entry.timeLabel;
+  if (entry.time instanceof Date) return formatClock(entry.time);
+  return "--";
 }
 
 function logReading(data) {
@@ -501,7 +540,8 @@ function logReading(data) {
     hum,
     heatIndex,
     dist: toNumber(data.distance_cm),
-    buzzer: !!data.alarm_active
+    buzzer: !!data.alarm_active,
+    update_count: data.update_count
   };
 
   sessionLog.unshift(entry);
@@ -521,7 +561,7 @@ function renderLogTable() {
   logTableBody.innerHTML = sessionLog
     .map(entry => `
       <tr${entry.buzzer ? ' class="log-row-alarm"' : ""}>
-        <td>${formatClock(entry.time)}</td>
+        <td>${formatEntryTime(entry)}</td>
         <td>${entry.gas}</td>
         <td>${entry.flame}</td>
         <td>${entry.temp.toFixed(1)}</td>
@@ -532,6 +572,56 @@ function renderLogTable() {
       </tr>
     `)
     .join("");
+}
+
+
+function logEntryFromServer(item) {
+  const temp = toNumber(item.temperature_c);
+  const hum = toNumber(item.humidity_percent);
+  const heatIndex = getHeatIndex(item, temp, hum);
+  const alarm = !!(item.gas_warning || item.flame_warning || item.heat_index_warning || item.distance_warning);
+
+  return {
+    timeLabel: "#" + (item.update_count || "--"),
+    update_count: item.update_count || 0,
+    gas: toNumber(item.gas_raw),
+    flame: toNumber(item.flame_raw),
+    temp,
+    hum,
+    heatIndex,
+    dist: toNumber(item.distance_cm),
+    buzzer: alarm
+  };
+}
+
+function loadServerLogs() {
+  if (!isAuthenticated || serverLogsLoaded) return;
+
+  apiFetch("/api/logs", { cache: "no-store" })
+    .then(response => response.json())
+    .then(data => {
+      serverLogsLoaded = true;
+
+      if (!data.logs || !Array.isArray(data.logs)) return;
+
+      sessionLog.length = 0;
+
+      data.logs
+        .slice()
+        .reverse()
+        .forEach(item => sessionLog.push(logEntryFromServer(item)));
+
+      if (sessionLog.length > MAX_LOG_ROWS) {
+        sessionLog.length = MAX_LOG_ROWS;
+      }
+
+      renderLogTable();
+    })
+    .catch(err => {
+      if (err.message !== "LOGIN_REQUIRED") {
+        serverLogsLoaded = true;
+      }
+    });
 }
 
 function exportLogCsv() {
@@ -545,7 +635,7 @@ function exportLogCsv() {
     .slice()
     .reverse()
     .map(entry => [
-      entry.time.toISOString(),
+      entry.time instanceof Date ? entry.time.toISOString() : (entry.timeLabel || ""),
       entry.gas,
       entry.flame,
       entry.temp.toFixed(1),
@@ -570,15 +660,64 @@ function exportLogCsv() {
 
 function clearLog() {
   if (sessionLog.length === 0) return;
-  if (!confirm("Clear all logged readings for this session?")) return;
+  if (!confirm("Clear all logged readings?")) return;
+
   sessionLog.length = 0;
   renderLogTable();
+
+  if (currentUser && currentUser.is_admin === true) {
+    apiFetch("/api/logs/clear", { method: "POST" })
+      .catch(err => {
+        if (err.message !== "LOGIN_REQUIRED") {
+          alert(err.message || "Local table cleared, but device log was not cleared.");
+        }
+      });
+  }
 }
 
 const exportLogBtn = byId("exportLogBtn");
 const clearLogBtn = byId("clearLogBtn");
 if (exportLogBtn) exportLogBtn.addEventListener("click", exportLogCsv);
 if (clearLogBtn) clearLogBtn.addEventListener("click", clearLog);
+
+
+/* ---------- Admin users ---------- */
+const usersTableBody = byId("usersTableBody");
+const reloadUsersBtn = byId("reloadUsersBtn");
+
+function renderUsers(users) {
+  if (!usersTableBody) return;
+
+  if (!users || users.length === 0) {
+    usersTableBody.innerHTML = '<tr><td colspan="3" class="muted">No users found.</td></tr>';
+    return;
+  }
+
+  usersTableBody.innerHTML = users.map(user => `
+    <tr>
+      <td>${user.name || "--"}</td>
+      <td>${user.email || "--"}</td>
+      <td>${user.role || "user"}</td>
+    </tr>
+  `).join("");
+}
+
+function loadUsers() {
+  if (!isAuthenticated || !currentUser || currentUser.is_admin !== true) return;
+
+  apiFetch("/api/auth/users", { cache: "no-store" })
+    .then(response => response.json())
+    .then(data => renderUsers(data.users || []))
+    .catch(err => {
+      if (err.message !== "LOGIN_REQUIRED" && usersTableBody) {
+        usersTableBody.innerHTML = '<tr><td colspan="3" class="muted">Unable to load users.</td></tr>';
+      }
+    });
+}
+
+if (reloadUsersBtn) {
+  reloadUsersBtn.addEventListener("click", loadUsers);
+}
 
 if (shiftNotes) {
   try {
@@ -654,9 +793,9 @@ function updateDashboard(data) {
 
   setText("tableGas", formatMaybe(gas, 0, "raw", gasConnected));
   setText("tableFlame", formatMaybe(flame, 0, "raw", flameConnected));
-  setText("tableTemp", formatMaybe(temp, 1, "Â°C", dhtConnected));
+  setText("tableTemp", formatMaybe(temp, 1, "°C", dhtConnected));
   setText("tableHum", formatMaybe(hum, 1, "%", dhtConnected));
-  setText("tableHeatIndex", formatMaybe(heatIndex, 1, "Â°C", dhtConnected));
+  setText("tableHeatIndex", formatMaybe(heatIndex, 1, "°C", dhtConnected));
   setText("tableDist", formatMaybe(dist, 1, "cm", ultrasonicConnected));
   setText("tableGasConn", connectedText(gasConnected));
   setText("tableFlameConn", connectedText(flameConnected));
@@ -779,7 +918,7 @@ function renderWifiList(networks) {
         <svg class="icon"><use href="#icon-wifi" /></svg>
         <div>
           <strong>${ssid}</strong>
-          <span>RSSI: ${rssi} dBm ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· Security: ${auth}</span>
+          <span>RSSI: ${rssi} dBm • Security: ${auth}</span>
         </div>
       </div>
       <button class="small-btn">Select</button>
@@ -874,12 +1013,35 @@ function saveThresholds(event) {
 }
 
 /* ---------- Hardware pin configuration ---------- */
-const ADC_OPTIONS = ["A0", "ADC1", "ADC2", "ADC3", "ADC4", "ADC5", "ADC6", "ADC7"];
-const GPIO_OPTIONS = ["D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "GPIO3", "GPIO1"];
+const ADC_OPTIONS = ["A0"];
 
-const PIN_SELECT_IDS = [
-  "gas_adcPin",
-  "flame_adcPin",
+const DIGITAL_PIN_OPTIONS = [
+  "D0",
+  "D1",
+  "D2",
+  "D3",
+  "D4",
+  "D5",
+  "D6",
+  "D7",
+  "D8"
+];
+
+const PIN_OPTIONS_BY_SELECT = {
+  gas_digitalPin: DIGITAL_PIN_OPTIONS,
+  flame_adcPin: ADC_OPTIONS,
+  dht_dataPin: DIGITAL_PIN_OPTIONS,
+  ultrasonic_trigPin: DIGITAL_PIN_OPTIONS,
+  ultrasonic_echoPin: DIGITAL_PIN_OPTIONS,
+  led_gasPin: DIGITAL_PIN_OPTIONS,
+  led_flamePin: DIGITAL_PIN_OPTIONS,
+  led_heat_indexPin: DIGITAL_PIN_OPTIONS,
+  led_distancePin: DIGITAL_PIN_OPTIONS,
+  buzzerPin: DIGITAL_PIN_OPTIONS
+};
+
+const DIGITAL_PIN_SELECT_IDS = [
+  "gas_digitalPin",
   "dht_dataPin",
   "ultrasonic_trigPin",
   "ultrasonic_echoPin",
@@ -890,32 +1052,107 @@ const PIN_SELECT_IDS = [
   "buzzerPin"
 ];
 
-function fillSelect(id, options) {
+const PIN_SELECT_IDS = [
+  "gas_digitalPin",
+  "flame_adcPin",
+  ...DIGITAL_PIN_SELECT_IDS.filter(id => id !== "gas_digitalPin")
+];
+
+const DEFAULT_PIN_VALUES = {
+  gas_digitalPin: "D6",
+  flame_adcPin: "A0",
+  dht_dataPin: "D1",
+  ultrasonic_trigPin: "D2",
+  ultrasonic_echoPin: "D5",
+  led_gasPin: "D0",
+  led_flamePin: "D3",
+  led_heat_indexPin: "D4",
+  led_distancePin: "D8",
+  buzzerPin: "D7"
+};
+
+let pinSelectsInitialized = false;
+
+function optionIsAllowedForSelect(id, value) {
+  const allowed = PIN_OPTIONS_BY_SELECT[id] || [];
+  return allowed.includes(value);
+}
+
+function getUsedDigitalPins(exceptId) {
+  const used = new Set();
+
+  DIGITAL_PIN_SELECT_IDS.forEach(id => {
+    if (id === exceptId) return;
+
+    const select = byId(id);
+
+    if (select && select.value) {
+      used.add(select.value);
+    }
+  });
+
+  return used;
+}
+
+function renderPinSelect(id) {
   const select = byId(id);
-  if (!select || select.options.length > 0) return;
+  if (!select) return;
+
+  const current = select.value || DEFAULT_PIN_VALUES[id] || "";
+  const options = PIN_OPTIONS_BY_SELECT[id] || [];
+  const used = DIGITAL_PIN_SELECT_IDS.includes(id) ? getUsedDigitalPins(id) : new Set();
+
+  select.innerHTML = "";
 
   options.forEach(value => {
+    if (used.has(value) && value !== current) {
+      return;
+    }
+
     const option = document.createElement("option");
     option.value = value;
     option.textContent = value;
     select.appendChild(option);
   });
+
+  if (current && optionIsAllowedForSelect(id, current)) {
+    const exists = Array.from(select.options).some(option => option.value === current);
+
+    if (!exists) {
+      const option = document.createElement("option");
+      option.value = current;
+      option.textContent = current;
+      select.appendChild(option);
+    }
+
+    select.value = current;
+  }
+
+  if (!select.value && select.options.length > 0) {
+    select.value = select.options[0].value;
+  }
+}
+
+function updatePinDropdowns() {
+  PIN_SELECT_IDS.forEach(renderPinSelect);
 }
 
 function initPinSelects() {
-  fillSelect("gas_adcPin", ADC_OPTIONS);
-  fillSelect("flame_adcPin", ADC_OPTIONS);
+  updatePinDropdowns();
 
-  [
-    "dht_dataPin",
-    "ultrasonic_trigPin",
-    "ultrasonic_echoPin",
-    "led_gasPin",
-    "led_flamePin",
-    "led_heat_indexPin",
-    "led_distancePin",
-    "buzzerPin"
-  ].forEach(id => fillSelect(id, GPIO_OPTIONS));
+  if (pinSelectsInitialized) {
+    return;
+  }
+
+  PIN_SELECT_IDS.forEach(id => {
+    const select = byId(id);
+
+    if (select) {
+      select.addEventListener("change", updatePinDropdowns);
+    }
+  });
+
+  pinSelectsInitialized = true;
 }
 
 function setPinValue(id, value) {
@@ -923,6 +1160,11 @@ function setPinValue(id, value) {
   if (!select || value === undefined || value === null) return;
 
   const text = String(value);
+
+  if (!optionIsAllowedForSelect(id, text)) {
+    return;
+  }
+
   const exists = Array.from(select.options).some(option => option.value === text);
 
   if (!exists) {
@@ -933,6 +1175,24 @@ function setPinValue(id, value) {
   }
 
   select.value = text;
+}
+
+function validateUniqueDigitalPins() {
+  const used = new Map();
+
+  for (const id of DIGITAL_PIN_SELECT_IDS) {
+    const select = byId(id);
+    if (!select) continue;
+
+    if (used.has(select.value)) {
+      alert("Pin " + select.value + " is already used by another function. Choose a different pin.");
+      return false;
+    }
+
+    used.set(select.value, id);
+  }
+
+  return true;
 }
 
 function loadPinConfig() {
@@ -947,20 +1207,22 @@ function loadPinConfig() {
     .then(data => {
       const pins = data.pins || data;
 
-      setPinValue("gas_adcPin", pins.gas_adc || pins.gas_adc_channel || "A0");
-      setPinValue("flame_adcPin", pins.flame_adc || pins.flame_adc_channel || "ADC1");
+      setPinValue("gas_digitalPin", pins.gas_digital || pins.gas_digital_gpio || "D6");
+      setPinValue("flame_adcPin", pins.flame_adc || pins.flame_adc_channel || "A0");
       setPinValue("dht_dataPin", pins.dht_data || pins.dht_gpio || "D1");
       setPinValue("ultrasonic_trigPin", pins.ultrasonic_trig || pins.ultrasonic_trig_gpio || "D2");
       setPinValue("ultrasonic_echoPin", pins.ultrasonic_echo || pins.ultrasonic_echo_gpio || "D5");
       setPinValue("led_gasPin", pins.led_gas || pins.led_gas_gpio || "D0");
       setPinValue("led_flamePin", pins.led_flame || pins.led_flame_gpio || "D3");
       setPinValue("led_heat_indexPin", pins.led_heat_index || pins.led_heat_index_gpio || "D4");
-      setPinValue("led_distancePin", pins.led_distance || pins.led_distance_gpio || "D6");
+      setPinValue("led_distancePin", pins.led_distance || pins.led_distance_gpio || "D8");
       setPinValue("buzzerPin", pins.buzzer || pins.buzzer_gpio || "D7");
+
+      updatePinDropdowns();
     })
     .catch(err => {
       if (err.message !== "LOGIN_REQUIRED") {
-        /* Pin endpoint is optional for old firmware. Keep defaults visible. */
+        updatePinDropdowns();
       }
     });
 }
@@ -968,8 +1230,12 @@ function loadPinConfig() {
 function savePinConfig(event) {
   event.preventDefault();
 
+  if (!validateUniqueDigitalPins()) {
+    return;
+  }
+
   const config = {
-    gas_adc: byId("gas_adcPin").value,
+    gas_digital: byId("gas_digitalPin").value,
     flame_adc: byId("flame_adcPin").value,
     dht_data: byId("dht_dataPin").value,
     ultrasonic_trig: byId("ultrasonic_trigPin").value,
@@ -987,7 +1253,7 @@ function savePinConfig(event) {
     body: JSON.stringify(config)
   })
     .then(() => {
-      alert("Pin configuration saved.");
+      alert("Pin configuration saved and applied.");
     })
     .catch(err => {
       if (err.message !== "LOGIN_REQUIRED") {
@@ -1137,12 +1403,12 @@ if (pinConfigForm) pinConfigForm.addEventListener("submit", savePinConfig);
 initPinSelects();
 
 byId("testAlarmBtn").addEventListener("click", () => {
-  postAction("/api/alarm/test", "Firmware endpoint POST /api/alarm/test isn't ready yet.");
+  postAction("/api/alarm/test", "Alarm test failed.");
 });
 
 byId("restartBtn").addEventListener("click", () => {
   if (confirm("Restart ESP8266 device?")) {
-    postAction("/api/system/restart", "Firmware endpoint POST /api/system/restart isn't ready yet.");
+    postAction("/api/system/restart", "Restart failed.");
   }
 });
 
@@ -1183,5 +1449,8 @@ setInterval(() => {
     loadStatus();
   }
 }, 1000);
+
+
+
 
 

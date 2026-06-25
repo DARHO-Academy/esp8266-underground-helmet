@@ -5,13 +5,86 @@
 #include "esp_event_loop.h"
 #include "esp_log.h"
 #include "tcpip_adapter.h"
+#include "nvs.h"
 
 #include <string.h>
 
 static const char *TAG = "APP_WIFI";
 
+#define WIFI_NVS_NAMESPACE  "wifi_cfg"
+#define WIFI_NVS_SSID_KEY   "ssid"
+#define WIFI_NVS_PASS_KEY   "pass"
+
 static bool wifi_ready = false;
 static int retry_count = 0;
+static char active_ssid[APP_WIFI_SSID_MAX_LEN];
+
+static bool app_wifi_load_credentials(char *ssid, size_t ssid_size, char *password, size_t password_size)
+{
+    if (ssid == NULL || password == NULL || ssid_size == 0 || password_size == 0) {
+        return false;
+    }
+
+    ssid[0] = '\0';
+    password[0] = '\0';
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &handle);
+
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    size_t ssid_len = ssid_size;
+    err = nvs_get_str(handle, WIFI_NVS_SSID_KEY, ssid, &ssid_len);
+
+    if (err != ESP_OK || ssid[0] == '\0') {
+        nvs_close(handle);
+        return false;
+    }
+
+    size_t pass_len = password_size;
+    err = nvs_get_str(handle, WIFI_NVS_PASS_KEY, password, &pass_len);
+
+    if (err != ESP_OK) {
+        password[0] = '\0';
+    }
+
+    nvs_close(handle);
+    return true;
+}
+
+static bool app_wifi_save_credentials(const char *ssid, const char *password)
+{
+    if (ssid == NULL || strlen(ssid) == 0 || strlen(ssid) >= 33) {
+        return false;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open Wi-Fi NVS namespace");
+        return false;
+    }
+
+    bool ok = true;
+
+    ok &= (nvs_set_str(handle, WIFI_NVS_SSID_KEY, ssid) == ESP_OK);
+    ok &= (nvs_set_str(handle, WIFI_NVS_PASS_KEY, password != NULL ? password : "") == ESP_OK);
+
+    if (ok) {
+        ok = (nvs_commit(handle) == ESP_OK);
+    }
+
+    nvs_close(handle);
+
+    if (!ok) {
+        ESP_LOGE(TAG, "Failed to save Wi-Fi credentials");
+    }
+
+    return ok;
+}
 
 static esp_err_t app_wifi_event_handler(void *ctx, system_event_t *event)
 {
@@ -65,19 +138,38 @@ void app_wifi_init(void)
     wifi_config_t wifi_config;
     memset(&wifi_config, 0, sizeof(wifi_config));
 
-    strncpy((char *)wifi_config.sta.ssid, APP_WIFI_STA_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, APP_WIFI_STA_PASSWORD, sizeof(wifi_config.sta.password) - 1);
+    char saved_ssid[APP_WIFI_SSID_MAX_LEN];
+    char saved_password[64];
+
+    if (app_wifi_load_credentials(saved_ssid, sizeof(saved_ssid), saved_password, sizeof(saved_password))) {
+        strncpy((char *)wifi_config.sta.ssid, saved_ssid, sizeof(wifi_config.sta.ssid) - 1);
+        strncpy((char *)wifi_config.sta.password, saved_password, sizeof(wifi_config.sta.password) - 1);
+        strncpy(active_ssid, saved_ssid, sizeof(active_ssid) - 1);
+        active_ssid[sizeof(active_ssid) - 1] = '\0';
+        ESP_LOGI(TAG, "Loaded saved Wi-Fi SSID: %s", active_ssid);
+    } else {
+        strncpy((char *)wifi_config.sta.ssid, APP_WIFI_STA_SSID, sizeof(wifi_config.sta.ssid) - 1);
+        strncpy((char *)wifi_config.sta.password, APP_WIFI_STA_PASSWORD, sizeof(wifi_config.sta.password) - 1);
+        strncpy(active_ssid, APP_WIFI_STA_SSID, sizeof(active_ssid) - 1);
+        active_ssid[sizeof(active_ssid) - 1] = '\0';
+        ESP_LOGI(TAG, "Using default Wi-Fi SSID: %s", active_ssid);
+    }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Connecting to Wi-Fi SSID: %s", APP_WIFI_STA_SSID);
+    ESP_LOGI(TAG, "Connecting to Wi-Fi SSID: %s", active_ssid);
 }
 
 bool app_wifi_is_ready(void)
 {
     return wifi_ready;
+}
+
+const char *app_wifi_get_active_ssid(void)
+{
+    return active_ssid;
 }
 
 bool app_wifi_scan(app_wifi_scan_result_t *out_results, int *out_count)
@@ -92,11 +184,6 @@ bool app_wifi_scan(app_wifi_scan_result_t *out_results, int *out_count)
     memset(&scan_config, 0, sizeof(scan_config));
     scan_config.show_hidden = false;
 
-    /*
-     * Blocking scan: simplest to reason about for a request/response HTTP
-     * handler. Scanning briefly interrupts the station's normal traffic,
-     * which is an acceptable tradeoff for a manual "scan networks" action.
-     */
     esp_err_t err = esp_wifi_scan_start(&scan_config, true);
 
     if (err != ESP_OK) {
@@ -142,6 +229,10 @@ bool app_wifi_connect(const char *ssid, const char *password)
         return false;
     }
 
+    if (!app_wifi_save_credentials(ssid, password)) {
+        return false;
+    }
+
     wifi_config_t wifi_config;
     memset(&wifi_config, 0, sizeof(wifi_config));
 
@@ -150,6 +241,9 @@ bool app_wifi_connect(const char *ssid, const char *password)
     if (password != NULL) {
         strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
     }
+
+    strncpy(active_ssid, ssid, sizeof(active_ssid) - 1);
+    active_ssid[sizeof(active_ssid) - 1] = '\0';
 
     wifi_ready = false;
     retry_count = 0;
@@ -171,8 +265,7 @@ bool app_wifi_connect(const char *ssid, const char *password)
         return false;
     }
 
-    ESP_LOGI(TAG, "Connecting to new Wi-Fi SSID: %s", ssid);
+    ESP_LOGI(TAG, "Connecting to saved Wi-Fi SSID: %s", ssid);
 
     return true;
 }
-

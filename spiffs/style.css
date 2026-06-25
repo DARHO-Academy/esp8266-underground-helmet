@@ -1,7 +1,3 @@
-/* style.css Ã¢â‚¬â€ Underground Helmet Safety Monitor
-   Design system: concrete/graphite surfaces, safety-amber accent,
-   hazard-stripe signature, condensed industrial type. */
-
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
 
 * {
@@ -469,6 +465,21 @@ svg.icon {
 
 .auth-btn-top {
   display: inline-flex;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.danger-soft-btn {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: transparent;
+}
+
+.danger-soft-btn:hover {
+  background: var(--danger);
+  color: #fff;
 }
 
 .badge {
@@ -1716,3 +1727,4 @@ body.auth-locked .modal-close {
     grid-template-columns: 1fr;
   }
 }
+

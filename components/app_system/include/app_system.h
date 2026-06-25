@@ -46,7 +46,7 @@ typedef struct
 
 typedef struct
 {
-    int gas_adc_channel;
+    int gas_digital_gpio;
     int flame_adc_channel;
 
     int dht_gpio;
@@ -93,3 +93,4 @@ const app_system_pin_config_t *app_system_get_pins(void);
 bool app_system_set_pins(const app_system_pin_config_t *pins);
 
 #endif
+

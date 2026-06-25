@@ -17,7 +17,7 @@ static const char *TAG = "APP_SYSTEM";
 #define NVS_KEY_DISTANCE           "dist_warn"
 
 /* Pin keys */
-#define NVS_KEY_GAS_ADC            "gas_adc"
+#define NVS_KEY_GAS_DIGITAL        "gas_dig"
 #define NVS_KEY_FLAME_ADC          "flame_adc"
 #define NVS_KEY_DHT_GPIO           "dht_gpio"
 #define NVS_KEY_TRIG_GPIO          "trig_gpio"
@@ -70,7 +70,7 @@ static void load_default_thresholds(void)
 
 static void load_default_pins(void)
 {
-    pin_config.gas_adc_channel = APP_GAS_ADC_CHANNEL;
+    pin_config.gas_digital_gpio = APP_GAS_DIGITAL_GPIO;
     pin_config.flame_adc_channel = APP_FLAME_ADC_CHANNEL;
 
     pin_config.dht_gpio = APP_DHT_GPIO;
@@ -141,8 +141,8 @@ static void load_pins_from_nvs(void)
 
     int32_t value;
 
-    if (nvs_get_i32(handle, NVS_KEY_GAS_ADC, &value) == ESP_OK) {
-        pin_config.gas_adc_channel = (int)value;
+    if (nvs_get_i32(handle, NVS_KEY_GAS_DIGITAL, &value) == ESP_OK) {
+        pin_config.gas_digital_gpio = (int)value;
     }
 
     if (nvs_get_i32(handle, NVS_KEY_FLAME_ADC, &value) == ESP_OK) {
@@ -185,8 +185,8 @@ static void load_pins_from_nvs(void)
 
     ESP_LOGI(
         TAG,
-        "Loaded pins: gas_adc=%d flame_adc=%d dht=%d trig=%d echo=%d led_gas=%d led_flame=%d led_heat=%d led_dist=%d buzzer=%d",
-        pin_config.gas_adc_channel,
+        "Loaded pins: gas_digital=%d flame_adc=%d dht=%d trig=%d echo=%d led_gas=%d led_flame=%d led_heat=%d led_dist=%d buzzer=%d",
+        pin_config.gas_digital_gpio,
         pin_config.flame_adc_channel,
         pin_config.dht_gpio,
         pin_config.ultrasonic_trig_gpio,
@@ -237,7 +237,7 @@ static bool save_pins_to_nvs(const app_system_pin_config_t *pins)
 
     bool ok = true;
 
-    ok &= (nvs_set_i32(handle, NVS_KEY_GAS_ADC, pins->gas_adc_channel) == ESP_OK);
+    ok &= (nvs_set_i32(handle, NVS_KEY_GAS_DIGITAL, pins->gas_digital_gpio) == ESP_OK);
     ok &= (nvs_set_i32(handle, NVS_KEY_FLAME_ADC, pins->flame_adc_channel) == ESP_OK);
 
     ok &= (nvs_set_i32(handle, NVS_KEY_DHT_GPIO, pins->dht_gpio) == ESP_OK);
@@ -267,16 +267,14 @@ static bool gpio_is_valid(int gpio)
 
 static bool adc_channel_is_valid(int channel)
 {
-    /*
-     * ESP8266 internal ADC is channel 0 only.
-     * Channels above 0 are allowed here only for future external ADC/multiplexer logic.
-     */
-    return channel >= 0 && channel <= 7;
+    /* ESP8266 internal ADC is A0 only in this firmware. */
+    return channel == 0;
 }
 
 static bool digital_pin_used_twice(const app_system_pin_config_t *pins)
 {
     int values[] = {
+        pins->gas_digital_gpio,
         pins->dht_gpio,
         pins->ultrasonic_trig_gpio,
         pins->ultrasonic_echo_gpio,
@@ -306,7 +304,7 @@ static bool pin_config_is_valid(const app_system_pin_config_t *pins)
         return false;
     }
 
-    if (!adc_channel_is_valid(pins->gas_adc_channel)) {
+    if (!gpio_is_valid(pins->gas_digital_gpio)) {
         return false;
     }
 
@@ -537,8 +535,8 @@ bool app_system_set_pins(const app_system_pin_config_t *pins)
 
     ESP_LOGI(
         TAG,
-        "Pins updated: gas_adc=%d flame_adc=%d dht=%d trig=%d echo=%d led_gas=%d led_flame=%d led_heat=%d led_dist=%d buzzer=%d",
-        pin_config.gas_adc_channel,
+        "Pins updated: gas_digital=%d flame_adc=%d dht=%d trig=%d echo=%d led_gas=%d led_flame=%d led_heat=%d led_dist=%d buzzer=%d",
+        pin_config.gas_digital_gpio,
         pin_config.flame_adc_channel,
         pin_config.dht_gpio,
         pin_config.ultrasonic_trig_gpio,
@@ -552,3 +550,4 @@ bool app_system_set_pins(const app_system_pin_config_t *pins)
 
     return true;
 }
+

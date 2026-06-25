@@ -4,7 +4,9 @@
 #include "app_wifi.h"
 #include "app_auth.h"
 #include "app_outputs.h"
+#include "app_sensors.h"
 #include "app_ota.h"
+#include "app_logs.h"
 #include "json_min.h"
 
 #include "esp_http_server.h"
@@ -293,6 +295,9 @@ static void send_json_response(httpd_req_t *req, int status_code, const char *js
         case 401:
             httpd_resp_set_status(req, "401 Unauthorized");
             break;
+        case 403:
+            httpd_resp_set_status(req, "403 Forbidden");
+            break;
         case 409:
             httpd_resp_set_status(req, "409 Conflict");
             break;
@@ -389,6 +394,22 @@ static bool require_auth(httpd_req_t *req, char *out_email, size_t out_email_siz
     return true;
 }
 
+static bool require_admin(httpd_req_t *req)
+{
+    char email[APP_AUTH_USERNAME_MAX];
+
+    if (!require_auth(req, email, sizeof(email))) {
+        return false;
+    }
+
+    if (!app_auth_is_admin_email(email)) {
+        send_json_error(req, 403, "Admin access required");
+        return false;
+    }
+
+    return true;
+}
+
 /* ---------- Static files ---------- */
 
 static esp_err_t root_handler(httpd_req_t *req)
@@ -426,7 +447,10 @@ static esp_err_t status_handler(httpd_req_t *req)
     format_float_1(state->heat_index_c, heat_index_text, sizeof(heat_index_text));
     format_float_1(state->distance_cm, distance_text, sizeof(distance_text));
 
-    char json[1300];
+    char safe_ssid[APP_WIFI_SSID_MAX_LEN * 2];
+    json_escape_string(app_wifi_get_active_ssid(), safe_ssid, sizeof(safe_ssid));
+
+    char json[1400];
 
     snprintf(
         json,
@@ -440,6 +464,7 @@ static esp_err_t status_handler(httpd_req_t *req)
         "\"distance_cm\":%s,"
 
         "\"wifi_connected\":%s,"
+        "\"wifi_ssid\":\"%s\","
         "\"system_alive\":%s,"
 
         "\"gas_connected\":%s,"
@@ -471,6 +496,7 @@ static esp_err_t status_handler(httpd_req_t *req)
         distance_text,
 
         state->wifi_connected ? "true" : "false",
+        safe_ssid,
         state->system_alive ? "true" : "false",
 
         state->gas_connected ? "true" : "false",
@@ -646,15 +672,30 @@ static esp_err_t auth_me_handler(httpd_req_t *req)
     snprintf(
         json,
         sizeof(json),
-        "{\"ok\":true,\"email\":\"%s\",\"name\":\"%s\"}",
+        "{\"ok\":true,\"email\":\"%s\",\"name\":\"%s\",\"is_admin\":%s}",
         safe_email,
-        safe_name
+        safe_name,
+        app_auth_is_admin_email(email) ? "true" : "false"
     );
 
     send_json_response(req, 200, json);
 
     return ESP_OK;
 }
+
+static esp_err_t auth_users_handler(httpd_req_t *req)
+{
+    if (!require_admin(req)) {
+        return ESP_OK;
+    }
+
+    char json[2048];
+    app_auth_users_json(json, sizeof(json));
+    send_json_response(req, 200, json);
+
+    return ESP_OK;
+}
+
 
 /* ---------- Wi-Fi ---------- */
 
@@ -831,7 +872,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
 
     const app_system_pin_config_t *pins = app_system_get_pins();
 
-    char gas_adc_label[16];
+    char gas_digital_label[16];
     char flame_adc_label[16];
 
     char dht_label[16];
@@ -845,7 +886,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
 
     char buzzer_label[16];
 
-    adc_to_label(pins->gas_adc_channel, gas_adc_label, sizeof(gas_adc_label));
+    gpio_to_label(pins->gas_digital_gpio, gas_digital_label, sizeof(gas_digital_label));
     adc_to_label(pins->flame_adc_channel, flame_adc_label, sizeof(flame_adc_label));
 
     gpio_to_label(pins->dht_gpio, dht_label, sizeof(dht_label));
@@ -866,7 +907,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
         sizeof(json),
         "{"
         "\"pins\":{"
-            "\"gas_adc_channel\":%d,"
+            "\"gas_digital_gpio\":%d,"
             "\"flame_adc_channel\":%d,"
             "\"dht_gpio\":%d,"
             "\"ultrasonic_trig_gpio\":%d,"
@@ -877,7 +918,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
             "\"led_distance_gpio\":%d,"
             "\"buzzer_gpio\":%d,"
 
-            "\"gas_adc\":\"%s\","
+            "\"gas_digital\":\"%s\","
             "\"flame_adc\":\"%s\","
             "\"dht_data\":\"%s\","
             "\"ultrasonic_trig\":\"%s\","
@@ -889,7 +930,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
             "\"buzzer\":\"%s\""
         "}"
         "}",
-        pins->gas_adc_channel,
+        pins->gas_digital_gpio,
         pins->flame_adc_channel,
         pins->dht_gpio,
         pins->ultrasonic_trig_gpio,
@@ -900,7 +941,7 @@ static esp_err_t pins_get_handler(httpd_req_t *req)
         pins->led_distance_gpio,
         pins->buzzer_gpio,
 
-        gas_adc_label,
+        gas_digital_label,
         flame_adc_label,
         dht_label,
         trig_label,
@@ -935,7 +976,7 @@ static esp_err_t pins_post_handler(httpd_req_t *req)
 
     new_pins = *current;
 
-    get_adc_from_json(body, "gas_adc_channel", "gas_adc", &new_pins.gas_adc_channel);
+    get_gpio_from_json(body, "gas_digital_gpio", "gas_digital", &new_pins.gas_digital_gpio);
     get_adc_from_json(body, "flame_adc_channel", "flame_adc", &new_pins.flame_adc_channel);
 
     get_gpio_from_json(body, "dht_gpio", "dht_data", &new_pins.dht_gpio);
@@ -954,10 +995,40 @@ static esp_err_t pins_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    send_json_response(req, 200, "{\"ok\":true}");
+    app_outputs_init();
+    app_sensors_init();
+
+    send_json_response(req, 200, "{\"ok\":true,\"message\":\"Pin configuration saved and applied\"}");
 
     return ESP_OK;
 }
+
+/* ---------- Persistent logs ---------- */
+
+static esp_err_t logs_get_handler(httpd_req_t *req)
+{
+    if (!require_auth(req, NULL, 0)) {
+        return ESP_OK;
+    }
+
+    return app_logs_send_json(req);
+}
+
+static esp_err_t logs_clear_handler(httpd_req_t *req)
+{
+    if (!require_admin(req)) {
+        return ESP_OK;
+    }
+
+    if (!app_logs_clear()) {
+        send_json_error(req, 500, "Failed to clear logs");
+        return ESP_OK;
+    }
+
+    send_json_response(req, 200, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 
 /* ---------- Commands ---------- */
 
@@ -1039,7 +1110,7 @@ void app_webserver_init(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 32;
+    config.max_uri_handlers = 36;
     config.stack_size = 6144;
 
     ESP_LOGI(TAG, "Starting web server");
@@ -1054,6 +1125,7 @@ void app_webserver_init(void)
         httpd_uri_t login_uri = { .uri = "/api/auth/login", .method = HTTP_POST, .handler = auth_login_handler, .user_ctx = NULL };
         httpd_uri_t logout_uri = { .uri = "/api/auth/logout", .method = HTTP_POST, .handler = auth_logout_handler, .user_ctx = NULL };
         httpd_uri_t me_uri = { .uri = "/api/auth/me", .method = HTTP_GET, .handler = auth_me_handler, .user_ctx = NULL };
+        httpd_uri_t users_uri = { .uri = "/api/auth/users", .method = HTTP_GET, .handler = auth_users_handler, .user_ctx = NULL };
 
         httpd_uri_t wifi_scan_uri = { .uri = "/api/wifi/scan", .method = HTTP_GET, .handler = wifi_scan_handler, .user_ctx = NULL };
         httpd_uri_t wifi_connect_uri = { .uri = "/api/wifi/connect", .method = HTTP_POST, .handler = wifi_connect_handler, .user_ctx = NULL };
@@ -1065,6 +1137,9 @@ void app_webserver_init(void)
 
         httpd_uri_t alarm_test_uri = { .uri = "/api/alarm/test", .method = HTTP_POST, .handler = alarm_test_handler, .user_ctx = NULL };
         httpd_uri_t restart_uri = { .uri = "/api/system/restart", .method = HTTP_POST, .handler = system_restart_handler, .user_ctx = NULL };
+
+        httpd_uri_t logs_get_uri = { .uri = "/api/logs", .method = HTTP_GET, .handler = logs_get_handler, .user_ctx = NULL };
+        httpd_uri_t logs_clear_uri = { .uri = "/api/logs/clear", .method = HTTP_POST, .handler = logs_clear_handler, .user_ctx = NULL };
 
         httpd_uri_t ota_status_uri = { .uri = "/api/ota/status", .method = HTTP_GET, .handler = ota_status_handler, .user_ctx = NULL };
         httpd_uri_t ota_firmware_uri = { .uri = "/api/ota/firmware", .method = HTTP_POST, .handler = ota_firmware_upload_handler, .user_ctx = NULL };
@@ -1079,6 +1154,7 @@ void app_webserver_init(void)
         register_uri_checked(&login_uri);
         register_uri_checked(&logout_uri);
         register_uri_checked(&me_uri);
+        register_uri_checked(&users_uri);
 
         register_uri_checked(&wifi_scan_uri);
         register_uri_checked(&wifi_connect_uri);
@@ -1091,6 +1167,9 @@ void app_webserver_init(void)
         register_uri_checked(&alarm_test_uri);
         register_uri_checked(&restart_uri);
 
+        register_uri_checked(&logs_get_uri);
+        register_uri_checked(&logs_clear_uri);
+
         register_uri_checked(&ota_status_uri);
         register_uri_checked(&ota_firmware_uri);
         register_uri_checked(&ota_spiffs_uri);
@@ -1100,5 +1179,7 @@ void app_webserver_init(void)
         ESP_LOGE(TAG, "Failed to start web server");
     }
 }
+
+
 
 

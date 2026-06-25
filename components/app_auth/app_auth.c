@@ -12,12 +12,15 @@
 static const char *TAG = "APP_AUTH";
 
 #define USERS_FILE_PATH     "/spiffs/users.dat"
+#define ADMIN_EMAIL         "admin"
+#define ADMIN_PASSWORD      "12345678"
+#define ADMIN_NAME          "Administrator"
 #define SALT_LEN_BYTES      8
 #define SALT_HEX_LEN        (SALT_LEN_BYTES * 2)
 #define HASH_LEN_BYTES      32
 #define HASH_HEX_LEN        (HASH_LEN_BYTES * 2)
-#define USER_LINE_MAX        160
-#define SESSION_TTL_SECONDS  (12 * 60 * 60) /* 12 hours */
+#define USER_LINE_MAX       160
+#define SESSION_TTL_SECONDS (12 * 60 * 60) /* 12 hours */
 
 typedef struct {
     bool in_use;
@@ -37,6 +40,7 @@ static void bytes_to_hex(const uint8_t *bytes, size_t len, char *out_hex)
         out_hex[i * 2]     = digits[(bytes[i] >> 4) & 0x0F];
         out_hex[i * 2 + 1] = digits[bytes[i] & 0x0F];
     }
+
     out_hex[len * 2] = '\0';
 }
 
@@ -68,11 +72,6 @@ static void hash_password(const char *password, const char *salt_hex, char *out_
     bytes_to_hex(digest, sizeof(digest), out_hash_hex);
 }
 
-/*
- * Each stored line looks like:
- *   email|salt_hex|hash_hex|full_name\n
- * Fields cannot contain '|' or newline; inputs are validated for this.
- */
 static bool field_is_clean(const char *value)
 {
     if (value == NULL) {
@@ -86,6 +85,16 @@ static bool field_is_clean(const char *value)
     }
 
     return true;
+}
+
+static bool is_admin_email_value(const char *email)
+{
+    return email != NULL && strcmp(email, ADMIN_EMAIL) == 0;
+}
+
+bool app_auth_is_admin_email(const char *email)
+{
+    return is_admin_email_value(email);
 }
 
 static bool find_user_line(const char *email, char *out_line, size_t out_line_size)
@@ -132,6 +141,7 @@ void app_auth_init(void)
     fclose(file);
 
     ESP_LOGI(TAG, "Auth store ready at %s", USERS_FILE_PATH);
+    ESP_LOGI(TAG, "Permanent admin login enabled: %s", ADMIN_EMAIL);
 }
 
 app_auth_result_t app_auth_register(
@@ -146,6 +156,10 @@ app_auth_result_t app_auth_register(
 
     if (strlen(email) == 0 || strlen(password) == 0) {
         return APP_AUTH_ERR_INVALID_INPUT;
+    }
+
+    if (is_admin_email_value(email)) {
+        return APP_AUTH_ERR_EXISTS;
     }
 
     if (strlen(email) >= APP_AUTH_USERNAME_MAX || strlen(full_name) >= APP_AUTH_NAME_MAX) {
@@ -183,7 +197,6 @@ static app_auth_session_t *find_free_session_slot(void)
 {
     int64_t now = (int64_t)time(NULL);
 
-    /* Prefer a genuinely empty slot, otherwise reuse the oldest expired one. */
     for (int i = 0; i < APP_AUTH_MAX_SESSIONS; i++) {
         if (!sessions[i].in_use) {
             return &sessions[i];
@@ -199,6 +212,34 @@ static app_auth_session_t *find_free_session_slot(void)
     return NULL;
 }
 
+static app_auth_result_t create_session(const char *email, const char *name, char *out_token)
+{
+    app_auth_session_t *slot = find_free_session_slot();
+
+    if (slot == NULL) {
+        return APP_AUTH_ERR_FULL;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+
+    generate_random_hex(slot->token, APP_AUTH_TOKEN_LEN / 2);
+    strncpy(slot->email, email, sizeof(slot->email) - 1);
+    slot->email[sizeof(slot->email) - 1] = '\0';
+
+    if (name != NULL) {
+        strncpy(slot->full_name, name, sizeof(slot->full_name) - 1);
+        slot->full_name[sizeof(slot->full_name) - 1] = '\0';
+    }
+
+    slot->expires_at = (int64_t)time(NULL) + SESSION_TTL_SECONDS;
+    slot->in_use = true;
+
+    strncpy(out_token, slot->token, APP_AUTH_TOKEN_LEN);
+    out_token[APP_AUTH_TOKEN_LEN] = '\0';
+
+    return APP_AUTH_OK;
+}
+
 app_auth_result_t app_auth_login(
     const char *email,
     const char *password,
@@ -209,17 +250,30 @@ app_auth_result_t app_auth_login(
         return APP_AUTH_ERR_INVALID_INPUT;
     }
 
+    if (is_admin_email_value(email)) {
+        if (strcmp(password, ADMIN_PASSWORD) != 0) {
+            return APP_AUTH_ERR_BAD_PASSWORD;
+        }
+
+        app_auth_result_t result = create_session(ADMIN_EMAIL, ADMIN_NAME, out_token);
+
+        if (result == APP_AUTH_OK) {
+            ESP_LOGI(TAG, "Admin login OK");
+        }
+
+        return result;
+    }
+
     char line[USER_LINE_MAX];
 
     if (!find_user_line(email, line, sizeof(line))) {
         return APP_AUTH_ERR_NOT_FOUND;
     }
 
-    /* line format: email|salt_hex|hash_hex|full_name\n */
     char *saved_email = strtok(line, "|");
-    char *saved_salt   = strtok(NULL, "|");
-    char *saved_hash   = strtok(NULL, "|");
-    char *saved_name   = strtok(NULL, "\r\n");
+    char *saved_salt  = strtok(NULL, "|");
+    char *saved_hash  = strtok(NULL, "|");
+    char *saved_name  = strtok(NULL, "\r\n");
 
     if (saved_email == NULL || saved_salt == NULL || saved_hash == NULL) {
         ESP_LOGE(TAG, "Corrupt user record for %s", email);
@@ -233,32 +287,13 @@ app_auth_result_t app_auth_login(
         return APP_AUTH_ERR_BAD_PASSWORD;
     }
 
-    app_auth_session_t *slot = find_free_session_slot();
+    app_auth_result_t result = create_session(email, saved_name != NULL ? saved_name : "", out_token);
 
-    if (slot == NULL) {
-        return APP_AUTH_ERR_FULL;
+    if (result == APP_AUTH_OK) {
+        ESP_LOGI(TAG, "Login OK for %s", email);
     }
 
-    generate_random_hex(slot->token, APP_AUTH_TOKEN_LEN / 2);
-    strncpy(slot->email, email, sizeof(slot->email) - 1);
-    slot->email[sizeof(slot->email) - 1] = '\0';
-
-    if (saved_name != NULL) {
-        strncpy(slot->full_name, saved_name, sizeof(slot->full_name) - 1);
-        slot->full_name[sizeof(slot->full_name) - 1] = '\0';
-    } else {
-        slot->full_name[0] = '\0';
-    }
-
-    slot->expires_at = (int64_t)time(NULL) + SESSION_TTL_SECONDS;
-    slot->in_use = true;
-
-    strncpy(out_token, slot->token, APP_AUTH_TOKEN_LEN);
-    out_token[APP_AUTH_TOKEN_LEN] = '\0';
-
-    ESP_LOGI(TAG, "Login OK for %s", email);
-
-    return APP_AUTH_OK;
+    return result;
 }
 
 void app_auth_logout(const char *token)
@@ -340,6 +375,17 @@ bool app_auth_session_get_user(
     return false;
 }
 
+bool app_auth_session_is_admin(const char *token)
+{
+    char email[APP_AUTH_USERNAME_MAX];
+
+    if (!app_auth_session_is_valid(token, email, sizeof(email))) {
+        return false;
+    }
+
+    return is_admin_email_value(email);
+}
+
 bool app_auth_extract_token_from_cookie(const char *cookie_header, char *out_token, size_t out_token_size)
 {
     if (cookie_header == NULL || out_token == NULL || out_token_size == 0) {
@@ -365,4 +411,94 @@ bool app_auth_extract_token_from_cookie(const char *cookie_header, char *out_tok
     out_token[i] = '\0';
 
     return i > 0;
+}
+
+static void json_escape_small(const char *input, char *output, size_t output_size)
+{
+    if (output == NULL || output_size == 0) {
+        return;
+    }
+
+    output[0] = '\0';
+
+    if (input == NULL) {
+        return;
+    }
+
+    size_t out = 0;
+
+    for (size_t i = 0; input[i] != '\0' && out < output_size - 1; i++) {
+        char ch = input[i];
+
+        if (ch == '"' || ch == '\\') {
+            if (out + 2 >= output_size) {
+                break;
+            }
+
+            output[out++] = '\\';
+            output[out++] = ch;
+        } else if ((unsigned char)ch < 0x20) {
+            continue;
+        } else {
+            output[out++] = ch;
+        }
+    }
+
+    output[out] = '\0';
+}
+
+void app_auth_users_json(char *out_json, size_t out_json_size)
+{
+    if (out_json == NULL || out_json_size == 0) {
+        return;
+    }
+
+    size_t offset = 0;
+
+    offset += snprintf(
+        out_json + offset,
+        out_json_size - offset,
+        "{\"ok\":true,\"users\":[{\"email\":\"%s\",\"name\":\"%s\",\"role\":\"admin\"}",
+        ADMIN_EMAIL,
+        ADMIN_NAME
+    );
+
+    FILE *file = fopen(USERS_FILE_PATH, "r");
+
+    if (file != NULL) {
+        char line[USER_LINE_MAX];
+
+        while (fgets(line, sizeof(line), file) != NULL && offset < out_json_size - 80) {
+            char line_copy[USER_LINE_MAX];
+            strncpy(line_copy, line, sizeof(line_copy) - 1);
+            line_copy[sizeof(line_copy) - 1] = '\0';
+
+            char *email = strtok(line_copy, "|");
+            (void)strtok(NULL, "|");
+            (void)strtok(NULL, "|");
+            char *name = strtok(NULL, "\r\n");
+
+            if (email == NULL || is_admin_email_value(email)) {
+                continue;
+            }
+
+            char safe_email[APP_AUTH_USERNAME_MAX * 2];
+            char safe_name[APP_AUTH_NAME_MAX * 2];
+
+            json_escape_small(email, safe_email, sizeof(safe_email));
+            json_escape_small(name != NULL ? name : "", safe_name, sizeof(safe_name));
+
+            offset += snprintf(
+                out_json + offset,
+                out_json_size - offset,
+                ",{\"email\":\"%s\",\"name\":\"%s\",\"role\":\"user\"}",
+                safe_email,
+                safe_name
+            );
+        }
+
+        fclose(file);
+    }
+
+    snprintf(out_json + offset, out_json_size - offset, "]}");
 }

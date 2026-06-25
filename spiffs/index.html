@@ -8,7 +8,6 @@
 </head>
 <body class="auth-locked">
 
-  <!-- Icon sprite: every icon in the UI is referenced from here via <use> -->
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
     <defs>
       <symbol id="icon-helmet" viewBox="0 0 24 24">
@@ -141,7 +140,6 @@
   </svg>
 
   <div class="app-shell">
-    <!-- Mobile top bar: hamburger + brand mark, visible only on small screens -->
     <header class="mobile-topbar">
       <button id="mobileMenuBtn" class="icon-btn" type="button" aria-label="Open menu" aria-expanded="false">
         <svg class="icon"><use href="#icon-menu" /></svg>
@@ -155,7 +153,6 @@
       </button>
     </header>
 
-    <!-- Dimmed backdrop shown behind the sidebar when it's open on mobile -->
     <div id="mobileNavOverlay" class="mobile-nav-overlay"></div>
 
     <aside class="sidebar" id="sidebar">
@@ -183,6 +180,10 @@
         </button>
         <button class="nav-btn" data-page="logs">
           <svg class="icon"><use href="#icon-note" /></svg> Logs &amp; Notes
+        </button>
+
+        <button id="usersNavBtn" class="nav-btn admin-only" data-page="users" hidden>
+          <svg class="icon"><use href="#icon-user" /></svg> Users
         </button>
         <p class="nav-label" style="margin-top:14px;">Configure</p>
         <button class="nav-btn" data-page="wifi">
@@ -213,14 +214,17 @@
     <main class="main">
       <header class="topbar">
         <div>
-          <p class="eyebrow">Embedded Safety System</p>
+          <p class="eyebrow">Helmet Safety</p>
           <h2 id="pageTitle">Dashboard</h2>
         </div>
 
         <div class="top-actions">
           <span id="systemBadge" class="badge neutral">Connecting...</span>
-          <button id="loginBtnTop" class="small-btn auth-btn-top">
+          <button id="loginBtnTop" class="small-btn auth-btn-top" type="button">
             <svg class="icon"><use href="#icon-user" /></svg> Log In
+          </button>
+          <button id="logoutBtnTop" class="small-btn danger-soft-btn" type="button" hidden>
+            Log Out
           </button>
         </div>
       </header>
@@ -232,7 +236,7 @@
             <div class="hero-text">
               <p class="eyebrow">Safety State</p>
               <h3 id="dangerTitle">Waiting for data</h3>
-              <p id="dangerText">The dashboard is waiting for the first reading from the helmet.</p>
+              <p id="dangerText">Waiting for helmet data.</p>
             </div>
             <div class="gauge">
               <svg viewBox="0 0 96 96">
@@ -275,7 +279,7 @@
               <span class="sensor-icon"><svg class="icon"><use href="#icon-flask" /></svg></span>
               <div>
                 <h3>Gas Level</h3>
-                <p>MQ sensor raw reading</p>
+                <p>MQ135 digital DO</p>
               </div>
             </div>
             <div class="reading"><span id="gasValue">--</span><small>raw</small></div>
@@ -288,7 +292,7 @@
               <span class="sensor-icon danger-icon"><svg class="icon"><use href="#icon-flame" /></svg></span>
               <div>
                 <h3>Flame Sensor</h3>
-                <p>Flame module raw reading</p>
+                <p>Analog A0 reading</p>
               </div>
             </div>
             <div class="reading"><span id="flameValue">--</span><small>raw</small></div>
@@ -301,14 +305,14 @@
               <span class="sensor-icon"><svg class="icon"><use href="#icon-thermometer" /></svg></span>
               <div>
                 <h3>DHT Temperature &amp; Humidity</h3>
-                <p>One DHT sensor gives temperature and humidity. Heat index is computed from both values.</p>
+                <p>Temperature, humidity, and heat index.</p>
               </div>
             </div>
 
             <div class="dht-reading-grid">
               <div class="dht-reading">
                 <span class="dht-label">Temperature</span>
-                <strong><span id="tempValue">--</span><small>Â°C</small></strong>
+                <strong><span id="tempValue">--</span><small>°C</small></strong>
               </div>
 
               <div class="dht-reading">
@@ -318,7 +322,7 @@
 
               <div class="dht-reading computed">
                 <span class="dht-label">Computed Heat Index</span>
-                <strong><span id="heatIndexValue">--</span><small>Â°C</small></strong>
+                <strong><span id="heatIndexValue">--</span><small>°C</small></strong>
               </div>
             </div>
 
@@ -331,7 +335,7 @@
               <span class="sensor-icon"><svg class="icon"><use href="#icon-radar" /></svg></span>
               <div>
                 <h3>Distance</h3>
-                <p>Nearest obstacle ahead</p>
+                <p>Obstacle distance</p>
               </div>
             </div>
             <div class="reading"><span id="distValue">--</span><small>cm</small></div>
@@ -344,7 +348,7 @@
       <section id="sensors" class="page">
         <div class="panel">
           <h3>Live Sensor Details</h3>
-          <p class="muted">Full raw status as reported by the ESP8266, updated every second.</p>
+          <p class="muted">Live values from the helmet.</p>
 
           <div class="table-wrap">
             <table>
@@ -376,7 +380,7 @@
           <div class="section-head">
             <div>
               <h3>Reading History</h3>
-              <p class="muted">Every reading received in this browser session, newest first. Export it any time as CSV.</p>
+              <p class="muted">Newest readings in this browser.</p>
             </div>
             <div class="logs-actions">
               <button id="exportLogBtn" class="small-btn">
@@ -393,9 +397,9 @@
                   <th>Time</th>
                   <th>Gas</th>
                   <th>Flame</th>
-                  <th>Temp Â°C</th>
+                  <th>Temp °C</th>
                   <th>Humidity %</th>
-                  <th>Heat Index Â°C</th>
+                  <th>Heat Index °C</th>
                   <th>Distance cm</th>
                   <th>Buzzer</th>
                 </tr>
@@ -409,8 +413,36 @@
 
         <div class="panel">
           <h3>Shift Notes</h3>
-          <p class="muted">Jot down anything worth remembering about this session Ã¢â‚¬â€ saved only in this browser tab.</p>
+          <p class="muted">Session notes saved in this browser tab.</p>
           <textarea id="shiftNotes" class="notes-area" placeholder="e.g. Checked helmet seal before descent, gas baseline reads a bit high near the east shaft..."></textarea>
+        </div>
+      </section>
+
+      <section id="users" class="page">
+        <div class="panel">
+          <div class="section-head">
+            <div>
+              <h3>Users</h3>
+              <p class="muted">Registered local accounts.</p>
+            </div>
+
+            <button id="reloadUsersBtn" class="small-btn">Reload Users</button>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Username</th>
+                  <th>Role</th>
+                </tr>
+              </thead>
+              <tbody id="usersTableBody">
+                <tr><td colspan="3" class="muted">Log in as admin to see users.</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </section>
 
@@ -419,15 +451,9 @@
           <div class="section-head">
             <div>
               <h3>Wi-Fi Setup</h3>
-              <p class="muted">Scan nearby networks and connect the helmet to one of them.</p>
+              <p class="muted">Connect the helmet to Wi-Fi.</p>
             </div>
             <button id="scanWifiBtn" class="primary-btn">Scan Networks</button>
-          </div>
-
-          <div id="wifiApiNotice" class="notice">
-            <svg class="icon"><use href="#icon-info" /></svg>
-            <span>Network scanning needs a firmware endpoint: <strong>GET /api/wifi/scan</strong>.
-            The current firmware only exposes <strong>/api/status</strong>.</span>
           </div>
 
           <div id="wifiList" class="wifi-list"></div>
@@ -447,34 +473,16 @@
           </form>
         </div>
 
-        <div class="panel">
-          <h3>Known Network Strategy</h3>
-          <p class="muted">
-            How the firmware should choose a network: scan, compare against saved credentials,
-            then connect to the strongest match.
-          </p>
-
-          <div class="logic-box">
-            <p>1. Browser requests a Wi-Fi scan.</p>
-            <p>2. ESP8266 runs <code>esp_wifi_scan_start()</code>.</p>
-            <p>3. Firmware compares scanned SSIDs against saved credentials.</p>
-            <p>4. The strongest matching network is selected by RSSI.</p>
-            <p>5. Firmware calls <code>esp_wifi_set_config()</code> then <code>esp_wifi_connect()</code>.</p>
-          </div>
-        </div>
       </section>
 
       <section id="thresholds" class="page">
         <div class="panel">
           <h3>Danger Thresholds</h3>
-          <p class="muted">
-            These limits decide when a sensor reading counts as a warning. They should be saved
-            to NVS or SPIFFS so they survive a restart, not hardcoded in app_config.h.
-          </p>
+          <p class="muted">Set warning limits.</p>
 
           <form id="thresholdForm" class="form-grid two">
             <label>
-              Gas Warning Level
+              Gas Digital Warning Level
               <input id="gasLimit" type="number" min="0" max="1023" value="600" />
             </label>
 
@@ -484,7 +492,7 @@
             </label>
 
             <label>
-              Computed Heat Index Warning Â°C
+              Computed Heat Index Warning °C
               <input id="heatIndexLimit" type="number" min="0" max="100" value="40" />
             </label>
 
@@ -496,10 +504,6 @@
             <button type="submit" class="primary-btn">Save Thresholds</button>
           </form>
 
-          <div class="notice">
-            <svg class="icon"><use href="#icon-info" /></svg>
-            <span>This UI sends gas, flame, computed heat index, and distance limits to <strong>POST /api/config/thresholds</strong>.</span>
-          </div>
         </div>
       </section>
 
@@ -519,7 +523,7 @@
 
         <div class="panel">
           <h3>Live Outputs</h3>
-          <p class="muted">Alarm is the buzzer sound. There is no separate alarm LED in this UI.</p>
+          <p class="muted">Buzzer alarm state.</p>
 
           <div class="output-grid">
             <div><span>Gas LED</span><strong id="ledGasState" class="state offline">--</strong></div>
@@ -532,16 +536,16 @@
 
         <div class="panel">
           <h3>Hardware Pins</h3>
-          <p class="muted">Configure sensors, warning LEDs, and the buzzer. Save, then restart if your firmware requires restart to apply pins.</p>
+          <p class="muted">Pin mapping.</p>
 
           <form id="pinConfigForm" class="form-grid two">
             <label>
-              Gas Analog
-              <select id="gas_adcPin"></select>
+              MQ135 Gas Digital DO
+              <select id="gas_digitalPin"></select>
             </label>
 
             <label>
-              Flame Analog
+              Flame Analog AO
               <select id="flame_adcPin"></select>
             </label>
 
@@ -588,25 +592,17 @@
             <button type="submit" class="primary-btn">Save Pin Configuration</button>
           </form>
 
-          <div class="notice">
-            <svg class="icon"><use href="#icon-info" /></svg>
-            <span>ESP8266 has only one internal analog input, A0. If gas and flame are both analog, use an external ADC or multiplexer.</span>
-          </div>
         </div>
 
         <div class="panel">
           <h3>System Actions</h3>
-          <p class="muted">Use these to test the buzzer alarm and restart the ESP8266.</p>
+          <p class="muted">Test the alarm or restart the device.</p>
 
           <div class="action-row">
             <button id="testAlarmBtn" class="secondary-btn">Test Alarm</button>
             <button id="restartBtn" class="danger-btn">Restart Device</button>
           </div>
 
-          <div class="notice">
-            <svg class="icon"><use href="#icon-info" /></svg>
-            <span>These actions call <strong>POST /api/alarm/test</strong> and <strong>POST /api/system/restart</strong>.</span>
-          </div>
         </div>
       </section>
 
@@ -615,7 +611,7 @@
           <div class="section-head">
             <div>
               <h3>OTA Updates</h3>
-              <p class="muted">Upload firmware and UI files from the dashboard after login. Use USB only for the first OTA partition-table flash.</p>
+              <p class="muted">Upload firmware or UI image.</p>
             </div>
             <button id="refreshOtaStatusBtn" class="small-btn">Refresh OTA Status</button>
           </div>
@@ -626,17 +622,12 @@
             <div><span>OTA Slot Size</span><strong id="otaSlotSize">--</strong></div>
             <div><span>SPIFFS Size</span><strong id="otaSpiffsSize">--</strong></div>
           </div>
-
-          <div class="notice warning-notice">
-            <svg class="icon"><use href="#icon-info" /></svg>
-            <span>Firmware OTA accepts only the application binary, usually <strong>build/underground_helmet.bin</strong>. Do not upload bootloader.bin or partitions.bin here.</span>
-          </div>
-        </div>
+</div>
 
         <div class="ota-grid">
           <div class="panel ota-card">
             <h3>Firmware OTA</h3>
-            <p class="muted">Updates C code, sensor logic, routes, authentication logic, outputs, and firmware behavior.</p>
+            <p class="muted">Updates device firmware.</p>
 
             <label class="file-picker">
               Application .bin
@@ -651,7 +642,7 @@
 
           <div class="panel ota-card">
             <h3>SPIFFS / UI OTA</h3>
-            <p class="muted">Updates web UI files: index.html, app.js, style.css, and other files inside the SPIFFS image.</p>
+            <p class="muted">Updates web interface files.</p>
 
             <label class="file-picker">
               SPIFFS image .bin
@@ -665,19 +656,10 @@
           </div>
         </div>
 
-        <div class="panel">
-          <h3>Build Output to Upload</h3>
-          <div class="logic-box">
-            <p><strong>Firmware:</strong> upload <code>build/underground_helmet.bin</code> to <code>POST /api/ota/firmware</code>.</p>
-            <p><strong>Web UI:</strong> build <code>build/spiffs.bin</code>, then upload it to <code>POST /api/ota/spiffs</code>.</p>
-            <p><strong>After upload:</strong> the ESP8266 writes flash, sends a JSON result, then restarts automatically.</p>
-          </div>
-        </div>
       </section>
     </main>
   </div>
 
-  <!-- Login / Register modal: dashboard stays locked until session is valid -->
   <div id="authModal" class="modal-overlay">
     <div class="modal-card">
       <button id="authCloseBtn" class="icon-btn modal-close" type="button" aria-label="Close">
@@ -689,7 +671,7 @@
       </div>
 
       <h3 id="authTitle">Log In</h3>
-      <p id="authSubtitle" class="muted">Access your helmet's safety dashboard.</p>
+      <p id="authSubtitle" class="muted">Enter your account details.</p>
 
       <form id="authForm" class="form-grid one">
         <label id="authNameField" style="display:none;">
@@ -698,8 +680,8 @@
         </label>
 
         <label>
-          Email
-          <input id="authEmail" type="email" placeholder="you@example.com" autocomplete="email" required />
+          Username or Email
+          <input id="authEmail" type="text" placeholder="admin or user@example.com" autocomplete="username" required />
         </label>
 
         <label>
@@ -720,5 +702,8 @@
   <script src="/app.js"></script>
 </body>
 </html>
+
+
+
 
 

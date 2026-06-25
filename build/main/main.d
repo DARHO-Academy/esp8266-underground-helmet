@@ -43,7 +43,10 @@ main.o: \
  C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_sensors/include/app_sensors.h \
  C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_system/include/app_system.h \
  C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_outputs/include/app_outputs.h \
- C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_config/include/app_config.h
+ C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_config/include/app_config.h \
+ C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_logs/include/app_logs.h \
+ C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/esp_http_server/include/esp_http_server.h \
+ C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/http_parser/include/http_parser.h
 
 C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/freertos/include/freertos/FreeRTOS.h:
 
@@ -132,4 +135,10 @@ C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_system/
 C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_outputs/include/app_outputs.h:
 
 C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_config/include/app_config.h:
+
+C:/darho/esp8266-rtos/academy/projects/underground-helmet/components/app_logs/include/app_logs.h:
+
+C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/esp_http_server/include/esp_http_server.h:
+
+C:/darho/esp8266-rtos/ESP8266_RTOS_SDK/components/http_parser/include/http_parser.h:
 /c/darho/esp8266-rtos/academy/projects/underground-helmet/main/./main.c:

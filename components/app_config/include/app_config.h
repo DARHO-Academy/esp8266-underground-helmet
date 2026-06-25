@@ -27,22 +27,18 @@
 
 /*
  * Sensor input mode:
- * 0 = do not show fake readings; dashboard will show sensors as not connected
- *     until real sensor drivers are added.
+ * 0 = read real sensors.
  * 1 = use fixed demo readings for UI/testing without hardware.
  */
 #define APP_SENSOR_USE_TEST_VALUES  0
 
 /*
- * ESP8266 has only one real analog input: A0.
- * APP_GAS_ADC_CHANNEL 0 means internal A0.
- * APP_FLAME_ADC_CHANNEL 1 means external ADC channel 1.
- *
- * If you do not use external ADC/multiplexer, gas and flame cannot both be
- * analog at the same time on ESP8266.
+ * ESP8266 has one real analog input: A0.
+ * In this wiring, flame sensor uses analog A0.
+ * MQ135 gas sensor uses digital DO on a GPIO.
  */
-#define APP_GAS_ADC_CHANNEL         0
-#define APP_FLAME_ADC_CHANNEL       1
+#define APP_FLAME_ADC_CHANNEL       0
+#define APP_GAS_DIGITAL_GPIO        12
 
 /*
  * Default digital sensor pins.
@@ -58,20 +54,19 @@
  * 3. Heat Index LED
  * 4. Distance LED
  *
- * Alarm is NOT a LED.
  * Alarm is the buzzer sound.
  */
 #define APP_LED_GAS_GPIO            16
 #define APP_LED_FLAME_GPIO          0
 #define APP_LED_HEAT_INDEX_GPIO     2
-#define APP_LED_DISTANCE_GPIO       12
+#define APP_LED_DISTANCE_GPIO       15
 
 #define APP_BUZZER_GPIO             13
 
 /*
  * Danger thresholds.
- * Temperature and humidity are not separate LEDs anymore.
- * They create one heat index value and one heat index warning LED.
+ * Gas is digital, so firmware maps gas danger to 1023 and normal to 0.
+ * Flame remains analog on A0.
  */
 #define APP_GAS_WARNING_LEVEL           600
 #define APP_FLAME_WARNING_LEVEL         500
@@ -79,12 +74,20 @@
 #define APP_DISTANCE_WARNING_CM         30
 
 /*
- * Flame sensor logic:
+ * Digital MQ module logic:
+ * 1 = gas warning when DO reads LOW
+ * 0 = gas warning when DO reads HIGH
+ *
+ * Most MQ135 LM393 modules output LOW when the adjusted gas threshold is crossed.
+ */
+#define APP_GAS_DIGITAL_ACTIVE_LOW      1
+
+/*
+ * Flame analog logic:
  * 0 = flame warning when analog value is LOWER than threshold
  * 1 = flame warning when analog value is HIGHER than threshold
  *
  * Many flame modules give lower analog value when flame is near.
- * Test your module and change this if needed.
  */
 #define APP_FLAME_HIGHER_IS_DANGER      0
 
@@ -93,5 +96,11 @@
  */
 #define APP_SENSOR_READ_DELAY_MS    2000
 #define APP_WEB_UPDATE_DELAY_MS     1000
+
+/*
+ * Persistent reading log.
+ * Old rows are removed automatically when this limit is reached.
+ */
+#define APP_LOG_MAX_LINES           100
 
 #endif

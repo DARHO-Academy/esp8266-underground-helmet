@@ -17,17 +17,13 @@ void app_wifi_init(void);
 
 bool app_wifi_is_ready(void);
 
-/*
- * Scans for nearby networks (blocking). Writes up to
- * APP_WIFI_SCAN_MAX_RESULTS into out_results and the actual count into
- * out_count. Returns false if the scan itself failed to start/complete.
- */
+const char *app_wifi_get_active_ssid(void);
+
 bool app_wifi_scan(app_wifi_scan_result_t *out_results, int *out_count);
 
 /*
- * Reconfigures the station with new credentials and (re)connects.
- * This does not block waiting for the connection result; call
- * app_wifi_is_ready() afterward to check connection status.
+ * Saves the selected credentials into NVS, reconnects immediately,
+ * and uses the same network again after reboot.
  */
 bool app_wifi_connect(const char *ssid, const char *password);
 

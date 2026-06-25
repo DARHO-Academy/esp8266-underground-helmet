@@ -10,6 +10,7 @@
 #include "app_system.h"
 #include "app_outputs.h"
 #include "app_config.h"
+#include "app_logs.h"
 
 static const char *TAG = "MAIN";
 
@@ -33,6 +34,7 @@ void app_main(void)
 
     app_wifi_init();
     app_webserver_init();
+    app_logs_init();
 
     while (1) {
         app_sensor_data_t sensor_data;
@@ -61,6 +63,7 @@ void app_main(void)
         const app_system_state_t *state = app_system_get_state();
 
         app_outputs_update(state);
+        app_logs_append_state(state);
 
         ESP_LOGI(
             TAG,
@@ -78,3 +81,4 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(APP_SENSOR_READ_DELAY_MS));
     }
 }
+
